@@ -1,7 +1,8 @@
 import customtkinter as ctk
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk, Menu
-import os, threading, subprocess, zipfile, shutil, psutil, re, time, hashlib, queue
+import os, threading, subprocess, zipfile, shutil, psutil, re, time, hashlib, queue, json
+import platform
 import xml.etree.ElementTree as ET
 
 try:
@@ -37,26 +38,81 @@ class APKMasterV59(ctk.CTk):
 
     # --- ABBREVIATION MAPPING FOR READABLE IMAGE NAMES ---
     ABBR_MAP = [
-        ("btn_",  "Button_"),
-        ("img_",  "Image_"),
-        ("ic_",   "Icon_"),
-        ("bg_",   "Background_"),
-        ("fg_",   "Foreground_"),
-        ("txt_",  "Text_"),
-        ("iv_",   "ImageView_"),
-        ("tv_",   "TextView_"),
+        ("btn_",       "Button_"),
+        ("img_",       "Image_"),
+        ("ic_",        "Icon_"),
+        ("bg_",        "Background_"),
+        ("fg_",        "Foreground_"),
+        ("txt_",       "Text_"),
+        ("iv_",        "ImageView_"),
+        ("tv_",        "TextView_"),
+        ("tab_",       "Tab_"),
+        ("nav_",       "Navigation_"),
+        ("menu_",      "Menu_"),
+        ("fab_",       "FloatingAction_"),
+        ("chip_",      "Chip_"),
+        ("switch_",    "Switch_"),
+        ("cb_",        "CheckBox_"),
+        ("rb_",        "RadioButton_"),
+        ("sb_",        "SeekBar_"),
+        ("pb_",        "ProgressBar_"),
+        ("ab_",        "ActionBar_"),
+        ("dl_",        "Dialog_"),
+        ("card_",      "Card_"),
+        ("divider_",   "Divider_"),
+        ("selector_",  "Selector_"),
+        ("ripple_",    "Ripple_"),
+        ("anim_",      "Animation_"),
+        ("sp_",        "Splash_"),
+        ("badge_",     "Badge_"),
+        ("toolbar_",   "Toolbar_"),
+        ("banner_",    "Banner_"),
+        ("av_",        "Avatar_"),
+        ("drawer_",    "Drawer_"),
+        ("snackbar_",  "Snackbar_"),
     ]
 
     # --- CATEGORY FOLDER MAPPING (prefix → folder name) ---
     CATEGORY_PREFIXES = {
-        "Button":     "Buttons",
-        "Icon":       "Icons",
-        "Image":      "Images",
-        "Background": "Backgrounds",
-        "Foreground": "Foregrounds",
-        "ImageView":  "ImageViews",
-        "TextView":   "TextViews",
+        "Button":         "Buttons",
+        "Icon":           "Icons",
+        "Image":          "Images",
+        "Background":     "Backgrounds",
+        "Foreground":     "Foregrounds",
+        "ImageView":      "ImageViews",
+        "TextView":       "TextViews",
+        "Tab":            "Tabs",
+        "Navigation":     "Navigation",
+        "Menu":           "Menus",
+        "FloatingAction": "FloatingActions",
+        "Chip":           "Chips",
+        "Switch":         "Switches",
+        "CheckBox":       "CheckBoxes",
+        "RadioButton":    "RadioButtons",
+        "SeekBar":        "SeekBars",
+        "ProgressBar":    "ProgressBars",
+        "ActionBar":      "ActionBars",
+        "Dialog":         "Dialogs",
+        "Card":           "Cards",
+        "Divider":        "Dividers",
+        "Selector":       "Selectors",
+        "Ripple":         "Ripples",
+        "Animation":      "Animations",
+        "Splash":         "Splashes",
+        "Badge":          "Badges",
+        "Toolbar":        "Toolbars",
+        "Banner":         "Banners",
+        "Avatar":         "Avatars",
+        "Drawer":         "Drawers",
+        "Snackbar":       "Snackbars",
     }
+
+    # --- STATE SUFFIXES (stripped during grouping so variants land together) ---
+    STATE_SUFFIXES = (
+        "_pressed", "_selected", "_focused", "_disabled", "_enabled",
+        "_normal", "_checked", "_unchecked", "_active", "_inactive",
+        "_hover", "_highlighted", "_default", "_on", "_off",
+    )
 
     # --- PERMISSION CLASSIFICATION ---
     PERMISSIONS_CRITICAL = {
@@ -121,10 +177,36 @@ class APKMasterV59(ctk.CTk):
 
         # --- SDK SIGNATURES ---
         self.SDK_PATTERNS = [
+            # Ad networks & attribution
             "com/google", "com/facebook", "com/appsflyer", "com/unity3d",
             "com/adjust", "com/firebase", "com/amazon", "com/mbridge",
             "io/fabric", "com/applovin", "com/ironsource", "com/vungle",
             "com/flurry", "com/tapjoy", "com/yandex/metrica", "com/onesignal",
+            "com/adcolony", "com/chartboost", "com/inmobi", "com/startapp",
+            # Analytics & crash reporting
+            "com/crashlytics", "com/newrelic", "com/mixpanel", "com/amplitude",
+            "com/segment", "io/sentry", "com/bugsnag", "com/datadog",
+            # Platform & runtime
+            "androidx/", "android/support", "kotlin/", "kotlinx/",
+            # Networking & serialisation
+            "com/squareup", "okhttp3/", "retrofit2/", "com/jakewharton",
+            # Image loading
+            "com/bumptech/glide", "com/squareup/picasso",
+            # Dependency injection
+            "dagger/", "javax/inject",
+            # Reactive
+            "io/reactivex", "org/reactivestreams",
+            # Database
+            "io/realm", "androidx/room",
+            # Payments
+            "com/stripe", "com/braintree", "com/paypal",
+            # Maps & location
+            "com/mapbox", "org/osmdroid",
+            # Messaging / support
+            "com/zendesk", "com/intercom",
+            # Platform vendors
+            "com/huawei", "com/samsung", "com/microsoft", "com/tencent",
+            "com/twitter",
         ]
 
         self.setup_ui()
@@ -223,11 +305,19 @@ class APKMasterV59(ctk.CTk):
         self.grid_rowconfigure(0, weight=1)
 
         # 1. Log console at bottom (must exist before any self.log() call)
+        log_frame = ctk.CTkFrame(self, fg_color="#111827", corner_radius=0)
+        log_frame.grid(row=1, column=0, columnspan=2, sticky="ew")
+        log_frame.grid_columnconfigure(0, weight=1)
         self.log_text = ctk.CTkTextbox(
-            self, height=130, font=("Consolas", 11),
+            log_frame, height=130, font=("Consolas", 11),
             fg_color="#111827", text_color="#00FF90", corner_radius=0,
         )
-        self.log_text.grid(row=1, column=0, columnspan=2, sticky="ew")
+        self.log_text.grid(row=0, column=0, sticky="nsew")
+        ctk.CTkButton(
+            log_frame, text="Log speichern", width=110, height=28,
+            font=("Segoe UI", 11), fg_color="#374151", hover_color="#4B5563",
+            corner_radius=6, command=self._export_log,
+        ).grid(row=0, column=1, padx=6, pady=4, sticky="ne")
 
         # 2. Left sidebar
         self._build_sidebar()
@@ -703,6 +793,31 @@ class APKMasterV59(ctk.CTk):
             pass
         return "Unidentifiziert", "err.apk", "ERR", "0"
 
+    def get_apk_extended_metadata(self, apk_path):
+        """Extract certificate signer and SDK versions (Androguard only).
+
+        Returns a dict with 'signer', 'min_sdk', 'target_sdk' keys.
+        Values are ``None`` when the information cannot be extracted.
+        """
+        info = {"signer": None, "min_sdk": None, "target_sdk": None}
+        if not ANDROGUARD_AVAILABLE:
+            return info
+        try:
+            a = APK(apk_path)
+            info["min_sdk"] = a.get_min_sdk_version()
+            info["target_sdk"] = a.get_target_sdk_version()
+            certs = a.get_certificates()
+            if certs:
+                cert = certs[0]
+                subject = cert.subject
+                parts = []
+                for attr in subject:
+                    parts.append(f"{attr.oid._name}={attr.value}")
+                info["signer"] = ", ".join(parts) if parts else str(subject)
+        except Exception:
+            pass
+        return info
+
     # =========================================================================
     # SCAN
     # =========================================================================
@@ -773,12 +888,21 @@ class APKMasterV59(ctk.CTk):
 
     def pipeline_thread_monolith(self):
         strat = self.mode_var.get()
+        total = len(self.pipeline_queue)
+        processed = 0
         while self.pipeline_queue:
             if not self.is_running:
                 break
             apk_p = self.pipeline_queue.pop(0)
+            processed += 1
             app_n, pkg, ver, code = self.get_apk_metadata(apk_p)
-            self.log(f"\n--- HARVESTING: {app_n} ---")
+            pct = int(processed / total * 100) if total else 0
+            self.log(f"\n--- [{processed}/{total} · {pct}%] HARVESTING: {app_n} ---")
+            self.after(0, lambda p=pct, n=app_n[:50]:
+                       self.status_var.set(f"Pipeline {p}% – {n}"))
+
+            ext_meta = self.get_apk_extended_metadata(apk_p)
+            apk_hash = self._apk_sha256(apk_p)
 
             target_dir = os.path.join(self.library_dir,
                                       f"{pkg.replace('.', '_')}_v{ver}")
@@ -790,14 +914,22 @@ class APKMasterV59(ctk.CTk):
                 ["java", "-Xmx4G", "-jar", apktool_jar, "d", apk_p,
                  "-o", workspace, "-f"]) == 0:
                 relevant_classes = []
+                threat_details = {}
+                sdk_inventory = {}
+                code_stats = {}
+                res_inventory = {}
+                layout_count = 0
                 if strat == "RAW":
                     self.security_only_scan_monolith(workspace, target_dir)
                 else:
                     if strat in ("FULL", "CODE"):
-                        relevant_classes = self.harvest_code_monolith(
-                            workspace, target_dir, pkg)
+                        relevant_classes, threat_details, sdk_inventory, code_stats = (
+                            self.harvest_code_monolith(workspace, target_dir, pkg))
                     if strat in ("FULL", "UI"):
-                        self.harvest_ux_monolith(workspace, target_dir)
+                        res_inventory = self.harvest_ux_monolith(
+                            workspace, target_dir)
+                        layout_count = self.harvest_layouts_monolith(
+                            workspace, target_dir)
                     if strat == "FULL":
                         self.run_cmd([
                             "java", "-Xmx4G", "-jar", apktool_jar, "b", workspace,
@@ -805,10 +937,19 @@ class APKMasterV59(ctk.CTk):
                         ])
 
                 permissions = self._extract_permissions_from_manifest(workspace)
+                components = self._extract_components_from_manifest(workspace)
                 domains = self._extract_network_domains(workspace)
                 self.generate_monolithic_report(
                     target_dir, app_n, pkg, ver, code, apk_p,
                     relevant_classes, permissions, domains,
+                    threat_details=threat_details,
+                    ext_meta=ext_meta,
+                    sdk_inventory=sdk_inventory,
+                    code_stats=code_stats,
+                    res_inventory=res_inventory,
+                    layout_count=layout_count,
+                    components=components,
+                    apk_hash=apk_hash,
                 )
                 if strat != "RAW":
                     shutil.rmtree(workspace, ignore_errors=True)
@@ -827,41 +968,64 @@ class APKMasterV59(ctk.CTk):
     # =========================================================================
 
     def _readable_name(self, filename):
-        """Expand filename abbreviations and capitalize path segments.
+        """Expand filename abbreviations, strip state suffixes, capitalise.
+
+        Returns ``(base_name, state_or_empty, extension)`` so callers can
+        group state variants (pressed, disabled …) under one folder.
 
         Examples:
-            btn_ok.png  -> (Button_Ok, .png)
-            ic_launcher -> (Icon_Launcher, .png)
-            my_screen   -> (My_Screen, .png)
+            btn_ok_pressed.png  -> ("Button_Ok", "pressed", ".png")
+            btn_ok.png          -> ("Button_Ok", "",        ".png")
+            ic_launcher.xml     -> ("Icon_Launcher", "",    ".xml")
+            my_screen.png       -> ("My_Screen", "",        ".png")
         """
         base, ext = os.path.splitext(filename)
         base_lower = base.lower()
+
+        # Detect and strip trailing state suffix
+        state = ""
+        for suf in self.STATE_SUFFIXES:
+            if base_lower.endswith(suf):
+                state = suf.lstrip("_")          # e.g. "pressed"
+                base = base[: len(base) - len(suf)]
+                break
+
+        base_lower = base.lower()               # re-compute after stripping
+
         for abbr, full in self.ABBR_MAP:
             if base_lower.startswith(abbr.lower()):
                 remainder = base[len(abbr):]
                 parts = re.split(r'[_\-]+', remainder)
                 remainder = "_".join(p.capitalize() for p in parts if p)
-                return full + remainder, ext
+                return full + remainder, state, ext
+
         # No abbreviation matched – just capitalise segments
         parts = re.split(r'[_\-]+', base)
-        return "_".join(p.capitalize() for p in parts if p), ext
+        return "_".join(p.capitalize() for p in parts if p), state, ext
 
     def harvest_ux_monolith(self, ws, target):
-        """Extract images into COMPARE_IMAGES/Category/BaseName/density.ext.
+        """Extract images into COMPARE_IMAGES/Category/BaseName/density[_state].ext.
 
         Grouping rules:
-        * Category is derived from the readable filename prefix (Button, Icon…)
+        * Category is derived from the readable filename prefix (Button, Icon …)
         * Files with the same base name (different densities) share one folder
+        * State variants (pressed, disabled …) land in the **same** folder
+          with the state appended to the density label, so all visual states
+          of one UI element sit side-by-side for easy comparison.
         * density is the suffix after 'drawable-' (hdpi, xhdpi, …)
         * Duplicate density files are not overwritten
+
+        Returns a summary dict ``{category: {base: [filenames]}}`` used to
+        build the resource inventory in Overview.md.
         """
         compare_p = os.path.join(target, "COMPARE_IMAGES")
         os.makedirs(compare_p, exist_ok=True)
         res_p = os.path.join(ws, "res")
         if not os.path.exists(res_p):
-            return
+            return {}
 
         density_re = re.compile(r'drawable-(\w+)', re.IGNORECASE)
+        inventory = {}                           # {category: {base: [file]}}
 
         for root, _, files in os.walk(res_p):
             dir_name = os.path.basename(root)
@@ -872,7 +1036,7 @@ class APKMasterV59(ctk.CTk):
                 if not f.lower().endswith((".png", ".jpg", ".webp", ".xml")):
                     continue
 
-                readable_base, ext = self._readable_name(f)
+                readable_base, state, ext = self._readable_name(f)
 
                 # Determine category folder from prefix
                 category = "Other"
@@ -884,16 +1048,55 @@ class APKMasterV59(ctk.CTk):
                 dest_dir = os.path.join(compare_p, category, readable_base)
                 os.makedirs(dest_dir, exist_ok=True)
 
-                dest_file = os.path.join(dest_dir, f"{density}{ext}")
-                if not os.path.exists(dest_file):  # skip duplicate densities
+                # Build filename: density[_state].ext
+                label = f"{density}_{state}" if state else density
+                dest_file = os.path.join(dest_dir, f"{label}{ext}")
+                if not os.path.exists(dest_file):
                     shutil.copy2(os.path.join(root, f), dest_file)
+
+                inventory.setdefault(category, {}).setdefault(
+                    readable_base, []).append(f"{label}{ext}")
+
+        return inventory
+
+    # ── LAYOUT HARVEST ────────────────────────────────────────────────────────
+
+    def harvest_layouts_monolith(self, ws, target):
+        """Copy decoded layout XMLs into _LAYOUTS/ to preserve UI structure.
+
+        Returns the number of layout files copied.
+        """
+        layouts_p = os.path.join(target, "_LAYOUTS")
+        res_p = os.path.join(ws, "res")
+        if not os.path.exists(res_p):
+            return 0
+        count = 0
+        for d in sorted(os.listdir(res_p)):
+            if not d.lower().startswith("layout"):
+                continue
+            src_dir = os.path.join(res_p, d)
+            if not os.path.isdir(src_dir):
+                continue
+            dest_dir = os.path.join(layouts_p, d)
+            os.makedirs(dest_dir, exist_ok=True)
+            for f in os.listdir(src_dir):
+                if f.lower().endswith(".xml"):
+                    shutil.copy2(os.path.join(src_dir, f),
+                                 os.path.join(dest_dir, f))
+                    count += 1
+        return count
 
     # =========================================================================
     # CODE HARVEST: returns relevant entry-point classes
     # =========================================================================
 
     def harvest_code_monolith(self, ws, target, pkg_id):
-        """Harvest smali; return list of relevant class names for Overview.md."""
+        """Harvest smali; return (relevant_classes, threat_details, sdk_inventory, code_stats).
+
+        *threat_details* maps category → list of flagged filenames.
+        *sdk_inventory*  maps SDK label → file count for the KB report.
+        *code_stats*     dict with 'core_files', 'sdk_files' totals.
+        """
         p_core = os.path.join(target, "_CODE")
         p_sdk  = os.path.join(target, "_SDK")
         p_sec  = os.path.join(target, "_THREATS")
@@ -902,6 +1105,10 @@ class APKMasterV59(ctk.CTk):
 
         pkg_sl = pkg_id.replace(".", "/")
         relevant_classes = []
+        threat_details = {}
+        sdk_inventory = {}       # SDK label → file count
+        core_count = 0
+        sdk_count = 0
         ENTRY_KEYWORDS = (
             "mainactivity", "service", "manager", "handler",
             "receiver", "provider", "worker",
@@ -914,7 +1121,12 @@ class APKMasterV59(ctk.CTk):
             for root, _, files in os.walk(s_dir):
                 rel = os.path.relpath(root, s_dir)
                 rel_fwd = rel.replace("\\", "/")
-                is_sdk  = any(s in rel_fwd for s in self.SDK_PATTERNS)
+                matched_sdk = None
+                for s in self.SDK_PATTERNS:
+                    if s in rel_fwd:
+                        matched_sdk = s
+                        break
+                is_sdk  = matched_sdk is not None
                 is_core = pkg_sl in rel_fwd and not is_sdk
                 dest = p_core if is_core else p_sdk
 
@@ -928,9 +1140,21 @@ class APKMasterV59(ctk.CTk):
                     except Exception:
                         continue
 
-                    # Threat scan
-                    if any(sig in content
-                           for sub in self.THREATS.values() for sig in sub):
+                    if is_core:
+                        core_count += 1
+                    else:
+                        sdk_count += 1
+                        if matched_sdk:
+                            sdk_inventory[matched_sdk] = (
+                                sdk_inventory.get(matched_sdk, 0) + 1)
+
+                    # Categorised threat scan
+                    flagged = False
+                    for cat, sigs in self.THREATS.items():
+                        if any(sig in content for sig in sigs):
+                            flagged = True
+                            threat_details.setdefault(cat, []).append(f)
+                    if flagged:
                         shutil.copy2(src, os.path.join(
                             p_sec, f"{rel.replace(os.sep, '_')}_{f}"))
 
@@ -950,7 +1174,8 @@ class APKMasterV59(ctk.CTk):
                     os.makedirs(df, exist_ok=True)
                     shutil.copy2(src, os.path.join(df, f))
 
-        return relevant_classes
+        code_stats = {"core_files": core_count, "sdk_files": sdk_count}
+        return relevant_classes, threat_details, sdk_inventory, code_stats
 
     def security_only_scan_monolith(self, ws, target):
         sec_p = os.path.join(target, "_SECURITY_RAW")
@@ -992,6 +1217,38 @@ class APKMasterV59(ctk.CTk):
             pass
         return permissions
 
+    def _extract_components_from_manifest(self, workspace):
+        """Parse manifest for Activities, Services, Receivers, Providers.
+
+        Returns a dict ``{component_type: [short_class_name, …]}`` which
+        gives an architectural overview of the app in the KB report.
+        """
+        manifest = os.path.join(workspace, "AndroidManifest.xml")
+        components = {
+            "Activity": [], "Service": [], "Receiver": [], "Provider": [],
+        }
+        if not os.path.exists(manifest):
+            return components
+        tag_map = {
+            "activity":  "Activity",
+            "service":   "Service",
+            "receiver":  "Receiver",
+            "provider":  "Provider",
+        }
+        try:
+            tree = ET.parse(manifest)
+            root = tree.getroot()
+            ns = "http://schemas.android.com/apk/res/android"
+            for tag, comp_type in tag_map.items():
+                for elem in root.iter(tag):
+                    name = elem.get(f"{{{ns}}}name") or elem.get("android:name", "")
+                    if name:
+                        short = name.rsplit(".", 1)[-1] if "." in name else name
+                        components[comp_type].append(short)
+        except Exception:
+            pass
+        return components
+
     # =========================================================================
     # NETWORK DOMAIN EXTRACTION
     # =========================================================================
@@ -1021,14 +1278,30 @@ class APKMasterV59(ctk.CTk):
 
     def generate_monolithic_report(self, target, name, pkg, ver, code, origin,
                                    relevant_classes=None, permissions=None,
-                                   domains=None):
-        """Write Overview.md with permission classification and domain deduplication."""
+                                   domains=None, *, threat_details=None,
+                                   ext_meta=None, sdk_inventory=None,
+                                   code_stats=None, res_inventory=None,
+                                   layout_count=0, components=None,
+                                   apk_hash=None):
+        """Write Overview.md + Overview.json + metadata.json (KB summary)."""
         if relevant_classes is None:
             relevant_classes = []
         if permissions is None:
             permissions = []
         if domains is None:
             domains = []
+        if threat_details is None:
+            threat_details = {}
+        if ext_meta is None:
+            ext_meta = {}
+        if sdk_inventory is None:
+            sdk_inventory = {}
+        if code_stats is None:
+            code_stats = {}
+        if res_inventory is None:
+            res_inventory = {}
+        if components is None:
+            components = {}
 
         # Classify permissions
         critical = sorted(p for p in permissions if p in self.PERMISSIONS_CRITICAL)
@@ -1042,15 +1315,67 @@ class APKMasterV59(ctk.CTk):
                          if any(ad in d for ad in self.AD_DOMAINS)]
         clean_domains = [d for d in domains if d not in ad_domains]
 
+        timestamp = time.ctime()
+
         lines = [
             f"# Overview: {name}",
             "",
             f"* **Package:** `{pkg}`",
             f"* **Version:** `{ver}` (Code: {code})",
             f"* **Source:** `{origin}`",
-            f"* **Date:** {time.ctime()}",
-            "",
+            f"* **Date:** {timestamp}",
         ]
+
+        # Extended metadata (signer, SDK versions)
+        signer = ext_meta.get("signer")
+        min_sdk = ext_meta.get("min_sdk")
+        target_sdk = ext_meta.get("target_sdk")
+        if min_sdk or target_sdk:
+            lines.append(
+                f"* **SDK:** min {min_sdk or '?'} / target {target_sdk or '?'}")
+        if signer:
+            lines.append(f"* **Signiert von:** `{signer}`")
+        lines.append("")
+
+        # --- App Architecture (from Manifest) ---
+        has_components = any(v for v in components.values())
+        if has_components:
+            lines += ["## 🏗 Architektur (Manifest)", ""]
+            for comp_type in ("Activity", "Service", "Receiver", "Provider"):
+                items = components.get(comp_type, [])
+                if items:
+                    lines.append(
+                        f"* **{len(items)} {comp_type}(s):** "
+                        + ", ".join(f"`{c}`" for c in items[:15]))
+                    if len(items) > 15:
+                        lines.append(
+                            f"  *(+ {len(items) - 15} weitere)*")
+            lines.append("")
+
+        # --- Code Structure (Knowledge Base) ---
+        if code_stats:
+            lines += ["## 📦 Code-Struktur", ""]
+            core_n = code_stats.get("core_files", 0)
+            sdk_n  = code_stats.get("sdk_files", 0)
+            lines.append(f"* **Kern-Code** (`_CODE/`): {core_n} Smali-Dateien")
+            lines.append(f"* **SDK / Libs** (`_SDK/`): {sdk_n} Smali-Dateien")
+            if core_n + sdk_n > 0:
+                pct = int(core_n / (core_n + sdk_n) * 100)
+                lines.append(
+                    f"* **Eigenanteil:** ~{pct}% eigener Code, "
+                    f"~{100 - pct}% Drittanbieter")
+            lines.append("")
+
+        # --- SDK Inventory ---
+        if sdk_inventory:
+            lines += ["## 🔌 Erkannte SDKs / Bibliotheken", ""]
+            for sdk_path in sorted(sdk_inventory,
+                                   key=lambda k: sdk_inventory[k],
+                                   reverse=True):
+                cnt = sdk_inventory[sdk_path]
+                label = sdk_path.replace("/", ".").strip(".")
+                lines.append(f"* `{label}` — {cnt} Dateien")
+            lines.append("")
 
         # --- Entry points ---
         lines += ["## Einstieg (vermutlich relevant)", ""]
@@ -1060,6 +1385,44 @@ class APKMasterV59(ctk.CTk):
         else:
             lines.append("* *(keine Kern-Klassen gefunden – ggf. obfuskiert)*")
         lines.append("")
+
+        # --- Resource Inventory (Knowledge Base) ---
+        if res_inventory:
+            total_res = sum(len(fs) for bases in res_inventory.values()
+                            for fs in bases.values())
+            total_elements = sum(len(bases) for bases in res_inventory.values())
+            lines += ["## 🎨 Ressourcen-Inventar (`COMPARE_IMAGES/`)", ""]
+            lines.append(
+                f"* **{total_res}** Dateien in **{total_elements}** "
+                f"UI-Elementen, **{len(res_inventory)}** Kategorien")
+            lines.append("")
+            for cat in sorted(res_inventory):
+                bases = res_inventory[cat]
+                lines.append(
+                    f"* **{cat}** — {len(bases)} Elemente")
+                for bname, fnames in sorted(bases.items())[:8]:
+                    states = set()
+                    densities = set()
+                    for fn in fnames:
+                        stem = os.path.splitext(fn)[0]
+                        if "_" in stem:
+                            parts = stem.split("_", 1)
+                            densities.add(parts[0])
+                            if len(parts) > 1:
+                                states.add(parts[1])
+                        else:
+                            densities.add(stem)
+                    info = ", ".join(sorted(densities))
+                    if states:
+                        info += f" | States: {', '.join(sorted(states))}"
+                    lines.append(f"  * `{bname}` ({info})")
+                if len(bases) > 8:
+                    lines.append(f"  * *(+ {len(bases) - 8} weitere)*")
+            lines.append("")
+            if layout_count:
+                lines.append(
+                    f"* **{layout_count}** Layout-XMLs in `_LAYOUTS/`")
+                lines.append("")
 
         # --- Permissions ---
         lines += ["## Berechtigungen", ""]
@@ -1095,10 +1458,19 @@ class APKMasterV59(ctk.CTk):
         if not domains:
             lines += ["*(keine URLs gefunden)*", ""]
 
-        # --- Threat summary ---
+        # --- Categorised threat summary ---
         lines += ["## Threat-Hinweise", ""]
         threat_dir = os.path.join(target, "_THREATS")
-        if os.path.exists(threat_dir):
+        if threat_details:
+            total_threat_files = sum(len(v) for v in threat_details.values())
+            lines.append(
+                f"* **{total_threat_files}** verdächtige Datei(en) in "
+                f"**{len(threat_details)}** Kategorie(n):")
+            lines.append("")
+            for cat in sorted(threat_details):
+                lines.append(f"  * **{cat}**: {len(threat_details[cat])} Treffer")
+            lines.append("")
+        elif os.path.exists(threat_dir):
             threat_files = os.listdir(threat_dir)
             if threat_files:
                 lines.append(
@@ -1109,10 +1481,79 @@ class APKMasterV59(ctk.CTk):
             lines.append("* *(Threat-Scan nicht ausgeführt)*")
         lines.append("")
 
-        out_path = os.path.join(target, "Overview.md")
-        with open(out_path, "w", encoding="utf-8") as fh:
+        # --- Write Markdown report ---
+        out_md = os.path.join(target, "Overview.md")
+        with open(out_md, "w", encoding="utf-8") as fh:
             fh.write("\n".join(lines))
-        self.log(f"Overview.md erstellt: {out_path}")
+        self.log(f"Overview.md erstellt: {out_md}")
+
+        # --- Write JSON report (machine-readable, enables CI/automation) ---
+        report_data = {
+            "package": pkg,
+            "app_name": name,
+            "version": ver,
+            "version_code": code,
+            "source": origin,
+            "date": timestamp,
+            "min_sdk": min_sdk,
+            "target_sdk": target_sdk,
+            "signer": signer,
+            "components": {k: v for k, v in components.items() if v},
+            "code_stats": code_stats,
+            "sdk_inventory": {k.replace("/", ".").strip("."): v
+                              for k, v in sdk_inventory.items()},
+            "entry_points": relevant_classes[:20],
+            "resource_inventory": {
+                cat: {base: fnames for base, fnames in bases.items()}
+                for cat, bases in res_inventory.items()
+            },
+            "layout_count": layout_count,
+            "permissions": {
+                "critical": critical,
+                "notable": notable,
+                "normal": normal,
+            },
+            "network": {
+                "domains": clean_domains,
+                "ad_tracking": ad_domains,
+            },
+            "threats": {cat: len(files) for cat, files in threat_details.items()},
+        }
+        out_json = os.path.join(target, "Overview.json")
+        with open(out_json, "w", encoding="utf-8") as fh:
+            json.dump(report_data, fh, indent=2, ensure_ascii=False)
+        self.log(f"Overview.json erstellt: {out_json}")
+
+        # --- Write metadata.json (AFKB-compatible sidecar) ---
+        sdk_inv = sdk_inventory or {}
+        found_sdk = sorted(
+            (k.replace("/", ".").strip(".") for k in sdk_inv),
+            key=lambda s: sdk_inv.get(s.replace(".", "/"), 0),
+            reverse=True,
+        )
+        total_hits = sum(
+            len(v) if isinstance(v, list) else int(v)
+            for v in threat_details.values()
+        ) if threat_details else 0
+        threat_score = min(10.0, round(total_hits / 5 + len(critical) * 0.5, 1))
+
+        metadata = {
+            "app_name": name,
+            "package_id": pkg,
+            "version_name": ver,
+            "version_code": int(code) if str(code).isdigit() else 0,
+            "sha256": apk_hash or "",
+            "threat_score": threat_score,
+            "found_sdk": found_sdk,
+            "heuristic_hits": {
+                cat: files if isinstance(files, list) else []
+                for cat, files in threat_details.items()
+            },
+        }
+        out_meta = os.path.join(target, "metadata.json")
+        with open(out_meta, "w", encoding="utf-8") as fh:
+            json.dump(metadata, fh, indent=2, ensure_ascii=False)
+        self.log(f"metadata.json erstellt: {out_meta}")
 
     # =========================================================================
     # TABLE / GRID
@@ -1189,6 +1630,21 @@ class APKMasterV59(ctk.CTk):
             self.sel_tree.move(k, "", i)
         self.sort_states[col] = rev
 
+    @staticmethod
+    def _open_folder(path):
+        """Open *path* in the platform's file manager (cross-platform)."""
+        folder = os.path.dirname(str(path))
+        try:
+            system = platform.system()
+            if system == "Windows":
+                os.startfile(folder)
+            elif system == "Darwin":
+                subprocess.Popen(["open", folder])
+            else:
+                subprocess.Popen(["xdg-open", folder])
+        except Exception:
+            pass
+
     def show_context_menu_monolith(self, event):
         item = self.sel_tree.identify_row(event.y)
         if item:
@@ -1196,7 +1652,7 @@ class APKMasterV59(ctk.CTk):
             m = Menu(self, tearoff=0)
             p = self.sel_tree.item(item)["values"][6]
             m.add_command(label="Im Explorer öffnen",
-                          command=lambda: os.startfile(os.path.dirname(p)))
+                          command=lambda: self._open_folder(p))
             m.post(event.x_root, event.y_root)
 
     def filter_table(self):
@@ -1326,6 +1782,21 @@ class APKMasterV59(ctk.CTk):
             except queue.Empty:
                 break
         self.after(100, self._drain_log)
+
+    def _export_log(self):
+        """Save the current log console content to a text file."""
+        path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text", "*.txt"), ("Log", "*.log")],
+            initialfile=f"apk_master_log_{time.strftime('%Y%m%d_%H%M%S')}.txt",
+        )
+        if path:
+            try:
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(self.log_text.get("1.0", "end"))
+                self.log(f"Log exportiert: {path}")
+            except Exception as e:
+                self.log(f"Fehler beim Log-Export: {e}")
 
     # =========================================================================
     # PATH MANAGEMENT
