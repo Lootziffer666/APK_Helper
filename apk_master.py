@@ -1,7 +1,14 @@
 import customtkinter as ctk
+import tkinter as tk
 from tkinter import filedialog, messagebox, ttk, Menu
-import os, threading, subprocess, zipfile, shutil, psutil, re, time
+import os, threading, subprocess, zipfile, shutil, psutil, re, time, hashlib, queue
 import xml.etree.ElementTree as ET
+
+try:
+    import yaml
+    YAML_AVAILABLE = True
+except ImportError:
+    YAML_AVAILABLE = False
 
 # --- FORENSIC ENGINE IMPORT ---
 try:
@@ -12,6 +19,18 @@ except ImportError:
 
 ctk.set_appearance_mode("light")
 ctk.set_default_color_theme("blue")
+
+# ── UI colour palette (dark-navy sidebar / light-lavender content) ─────────
+SIDEBAR_BG    = "#1B2642"   # dark navy sidebar background
+SIDEBAR_HOVER = "#243352"   # nav-button hover / active tint
+MAIN_BG       = "#EEF0F6"   # light lavender main background
+CARD_BG       = "#FFFFFF"   # card / panel white
+ACCENT        = "#E8604C"   # coral orange-red accent
+ACCENT2       = "#38C9B3"   # teal accent
+TEXT_LIGHT    = "#FFFFFF"
+TEXT_MUTED    = "#8E9BB3"
+TEXT_DARK     = "#1B2642"
+BORDER        = "#E2E6F0"
 
 
 class APKMasterV59(ctk.CTk):
@@ -73,7 +92,7 @@ class APKMasterV59(ctk.CTk):
     def __init__(self):
         super().__init__()
         self.title("APK Master V59")
-        self.geometry("1800x1100")
+        self.geometry("1600x1000")
 
         # --- PATHS & PERSISTENCE ---
         self.script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -97,7 +116,51 @@ class APKMasterV59(ctk.CTk):
         }
 
         # --- THREAT DATABASE ---
-        self.THREATS = {
+        self.THREATS = self._load_threats()
+        self._log_queue = queue.Queue()   # thread-safe log queue
+
+        # --- SDK SIGNATURES ---
+        self.SDK_PATTERNS = [
+            "com/google", "com/facebook", "com/appsflyer", "com/unity3d",
+            "com/adjust", "com/firebase", "com/amazon", "com/mbridge",
+            "io/fabric", "com/applovin", "com/ironsource", "com/vungle",
+            "com/flurry", "com/tapjoy", "com/yandex/metrica", "com/onesignal",
+        ]
+
+        self.setup_ui()
+        self.init_system()
+        self.load_all_configs()
+        self._drain_log()
+
+    # =========================================================================
+    # INIT
+    # =========================================================================
+
+    def init_system(self):
+        if not os.path.exists(self.library_dir):
+            os.makedirs(self.library_dir)
+        for f in [self.config_file, self.patterns_file]:
+            if not os.path.exists(f):
+                with open(f, "w", encoding="utf-8") as fh:
+                    fh.write("# APK Master Configuration\n")
+
+    def _load_threats(self):
+        """Load threat signatures from threats.yaml; fall back to built-in defaults."""
+        threats_path = os.path.join(self.script_dir, "threats.yaml")
+        if YAML_AVAILABLE and os.path.exists(threats_path):
+            try:
+                with open(threats_path, "r", encoding="utf-8") as fh:
+                    data = yaml.safe_load(fh)
+                if isinstance(data, dict):
+                    return {k: list(v) for k, v in data.items()}
+            except Exception:
+                pass
+        return self._default_threats()
+
+    @staticmethod
+    def _default_threats():
+        """Built-in threat signatures used when threats.yaml is absent or unreadable."""
+        return {
             "IDENTITY": [
                 "getDeviceId", "getSimSerialNumber", "getSubscriberId",
                 "getLine1Number", "INSTALL_REFERRER", "getImei", "getMeid",
@@ -137,262 +200,484 @@ class APKMasterV59(ctk.CTk):
             ],
         }
 
-        # --- SDK SIGNATURES ---
-        self.SDK_PATTERNS = [
-            "com/google", "com/facebook", "com/appsflyer", "com/unity3d",
-            "com/adjust", "com/firebase", "com/amazon", "com/mbridge",
-            "io/fabric", "com/applovin", "com/ironsource", "com/vungle",
-            "com/flurry", "com/tapjoy", "com/yandex/metrica", "com/onesignal",
-        ]
-
-        self.setup_ui()
-        self.init_system()
-        self.load_all_configs()
-
-    # =========================================================================
-    # INIT
-    # =========================================================================
-
-    def init_system(self):
-        if not os.path.exists(self.library_dir):
-            os.makedirs(self.library_dir)
-        for f in [self.config_file, self.patterns_file]:
-            if not os.path.exists(f):
-                with open(f, "w", encoding="utf-8") as fh:
-                    fh.write("# APK Master Configuration\n")
+    @staticmethod
+    def _apk_sha256(path):
+        """Compute SHA-256 hash of a file for reliable duplicate detection."""
+        h = hashlib.sha256()
+        try:
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    h.update(chunk)
+        except OSError:
+            pass
+        return h.hexdigest()
 
     # =========================================================================
     # UI SETUP
     # =========================================================================
 
     def setup_ui(self):
-        """Log widget is built first so it exists before load_all_configs is called."""
-        self.grid_columnconfigure(0, weight=1)
-        self.grid_rowconfigure(1, weight=1)
-        self.grid_rowconfigure(3, weight=0)
+        """Two-panel desktop layout: dark navy sidebar (left) + light main area (right)."""
+        self.configure(fg_color=MAIN_BG)
+        self.grid_columnconfigure(1, weight=1)
+        self.grid_rowconfigure(0, weight=1)
 
-        # 1. LOG (must come before everything that calls self.log())
+        # 1. Log console at bottom (must exist before any self.log() call)
         self.log_text = ctk.CTkTextbox(
-            self, height=150, font=("Consolas", 11),
-            fg_color="#1a1a1a", text_color="#00ff00",
+            self, height=130, font=("Consolas", 11),
+            fg_color="#111827", text_color="#00FF90", corner_radius=0,
         )
-        self.log_text.grid(row=3, column=0, sticky="ew", padx=25, pady=(0, 20))
+        self.log_text.grid(row=1, column=0, columnspan=2, sticky="ew")
 
-        # 2. HEADER
-        header = ctk.CTkFrame(self, height=90, fg_color="#ffffff", corner_radius=0)
-        header.grid(row=0, column=0, sticky="ew")
-        title_f = ctk.CTkFrame(header, fg_color="transparent")
-        title_f.pack(side="left", padx=40)
-        ctk.CTkLabel(title_f, text="APK Master V59",
-                     font=("Segoe UI", 34, "bold")).pack(anchor="w")
-        ctk.CTkLabel(title_f, text="APK Analysis Tool",
-                     font=("Segoe UI", 13), text_color="gray").pack(anchor="w")
+        # 2. Left sidebar
+        self._build_sidebar()
+
+        # 3. Main area (top bar + content views + status bar)
+        main = ctk.CTkFrame(self, fg_color=MAIN_BG, corner_radius=0)
+        main.grid(row=0, column=1, sticky="nsew")
+        main.grid_columnconfigure(0, weight=1)
+        main.grid_rowconfigure(1, weight=1)
+        self._main = main
+
+        self._build_topbar(main)
+        content = ctk.CTkFrame(main, fg_color="transparent")
+        content.grid(row=1, column=0, sticky="nsew")
+        content.grid_columnconfigure(0, weight=1)
+        content.grid_rowconfigure(0, weight=1)
+        self._content_area = content
+        self._build_statusbar(main)
+
+        # 4. Build individual view frames inside _content_area
+        self._views: dict = {}
+        self.setup_view_config()
+        self.setup_view_dashboard()
+        self.setup_view_pipeline()
+
+        # 5. Show dashboard by default
+        self._switch_view("dashboard")
+
+    # ── SIDEBAR ───────────────────────────────────────────────────────────────
+
+    def _build_sidebar(self):
+        """Dark navy left panel: title, donut-chart stats, navigation, scan button."""
+        sb = ctk.CTkFrame(self, width=280, fg_color=SIDEBAR_BG, corner_radius=0)
+        sb.grid(row=0, column=0, sticky="nsew")
+        sb.grid_propagate(False)
+        sb.grid_columnconfigure(0, weight=1)
+        sb.grid_rowconfigure(4, weight=1)   # spacer row above scan button
+        self._sidebar = sb
+
+        # Title
+        hdr = ctk.CTkFrame(sb, fg_color="transparent")
+        hdr.grid(row=0, column=0, sticky="ew", padx=24, pady=(32, 0))
+        ctk.CTkLabel(hdr, text="Welcome to",
+                     font=("Segoe UI", 12), text_color=TEXT_MUTED).pack(anchor="w")
+        ctk.CTkLabel(hdr, text="APK Master",
+                     font=("Segoe UI", 24, "bold"),
+                     text_color=TEXT_LIGHT).pack(anchor="w")
+
+        # Storage card with donut chart
+        card = ctk.CTkFrame(sb, fg_color=SIDEBAR_HOVER, corner_radius=16)
+        card.grid(row=1, column=0, sticky="ew", padx=16, pady=(22, 0))
+        self._chart_canvas = tk.Canvas(
+            card, width=110, height=110,
+            bg=SIDEBAR_HOVER, highlightthickness=0,
+        )
+        self._chart_canvas.pack(side="left", padx=(14, 4), pady=14)
+        info = ctk.CTkFrame(card, fg_color="transparent")
+        info.pack(side="left", fill="both", expand=True, padx=(0, 10))
+        self._stat_size_var  = ctk.StringVar(value="0 GB")
+        self._stat_count_var = ctk.StringVar(value="Total: 0 APKs")
+        ctk.CTkLabel(info, textvariable=self._stat_size_var,
+                     font=("Segoe UI", 20, "bold"),
+                     text_color=TEXT_LIGHT).pack(anchor="w", pady=(16, 0))
+        ctk.CTkLabel(info, textvariable=self._stat_count_var,
+                     font=("Segoe UI", 11),
+                     text_color=TEXT_MUTED).pack(anchor="w")
+        leg = ctk.CTkFrame(info, fg_color="transparent")
+        leg.pack(anchor="w", pady=(8, 16))
+        self._legend_dot(leg, ACCENT,  "Genutzt")
+        self._legend_dot(leg, ACCENT2, "Verfügbar")
+        self._draw_donut(0, 1)
+
+        # Separator
+        ctk.CTkFrame(sb, height=1, fg_color=SIDEBAR_HOVER).grid(
+            row=2, column=0, sticky="ew", padx=16, pady=(20, 6))
+
+        # Navigation buttons
+        nav = ctk.CTkFrame(sb, fg_color="transparent")
+        nav.grid(row=3, column=0, sticky="ew")
+        self._nav_btns = {}
+        for view_id, icon, label in [
+            ("dashboard", "📊", "Dashboard"),
+            ("config",    "⚙",  "Konfiguration"),
+            ("pipeline",  "▶",  "Pipeline"),
+        ]:
+            btn = ctk.CTkButton(
+                nav, text=f"  {icon}   {label}", anchor="w",
+                font=("Segoe UI", 14), height=46,
+                fg_color="transparent", hover_color=SIDEBAR_HOVER,
+                text_color=TEXT_MUTED, corner_radius=12,
+                command=lambda v=view_id: self._switch_view(v),
+            )
+            btn.pack(fill="x", padx=14, pady=2)
+            self._nav_btns[view_id] = btn
+
+        # Spacer
+        ctk.CTkFrame(sb, fg_color="transparent").grid(row=4, column=0, sticky="nsew")
+
+        # Scan button
+        ctk.CTkButton(
+            sb, text="SYSTEM-SCAN STARTEN", height=50,
+            font=("Segoe UI", 13, "bold"),
+            fg_color=ACCENT, hover_color="#C94A38", corner_radius=14,
+            command=self.start_deep_scan,
+        ).grid(row=5, column=0, sticky="ew", padx=16, pady=(0, 24))
+
+    def _legend_dot(self, parent, color, label):
+        """Coloured circle + text legend entry."""
+        row = ctk.CTkFrame(parent, fg_color="transparent")
+        row.pack(anchor="w", pady=1)
+        dot = tk.Canvas(row, width=10, height=10, bg=SIDEBAR_HOVER, highlightthickness=0)
+        dot.create_oval(1, 1, 9, 9, fill=color, outline="")
+        dot.pack(side="left")
+        ctk.CTkLabel(row, text=f"  {label}", font=("Segoe UI", 11),
+                     text_color=TEXT_MUTED).pack(side="left")
+
+    def _draw_donut(self, used: float, total: float):
+        """Redraw the donut ring chart on the sidebar canvas."""
+        c = self._chart_canvas
+        c.delete("all")
+        cx, cy, r, th = 55, 55, 42, 13
+        pct = (used / total * 100) if total > 0 else 0
+        # tkinter Canvas requires a non-zero extent; use a tiny value for 0% or 100%
+        _MIN = -0.001
+        ext_used = -(360 * pct / 100) if pct > 0 else _MIN
+        ext_free = -(360 * (1 - pct / 100)) if pct < 100 else _MIN
+        start_free = 90 + 360 * pct / 100
+        # Available ring (teal)
+        c.create_arc(cx - r, cy - r, cx + r, cy + r,
+                     start=start_free, extent=ext_free,
+                     style="arc", outline=ACCENT2, width=th)
+        # Used ring (coral)
+        c.create_arc(cx - r, cy - r, cx + r, cy + r,
+                     start=90, extent=ext_used,
+                     style="arc", outline=ACCENT, width=th)
+        label = f"{pct:.0f}%" if total > 0 else "–"
+        c.create_text(cx, cy, text=label, fill=TEXT_LIGHT,
+                      font=("Segoe UI", 12, "bold"))
+
+    def _update_sidebar_stats(self):
+        """Refresh sidebar donut chart and counters after a scan."""
+        total_apks = len(self.apk_registry)
+        total_gb   = sum(x["size_mb"] for x in self.apk_registry) / 1024
+        try:
+            disk       = psutil.disk_usage(self.script_dir)
+            disk_total = disk.total / (1024 ** 3)
+            disk_used  = disk.used  / (1024 ** 3)
+        except Exception:
+            disk_total = max(total_gb * 10, 1)
+            disk_used  = total_gb
+        self._stat_size_var.set(f"{total_gb:.1f} GB")
+        self._stat_count_var.set(f"Total: {total_apks} APKs")
+        self._draw_donut(disk_used, disk_total)
+
+    # ── TOP BAR ───────────────────────────────────────────────────────────────
+
+    def _build_topbar(self, parent):
+        """White bar at top of main area: search + action buttons + status."""
+        bar = ctk.CTkFrame(parent, fg_color=CARD_BG, height=70, corner_radius=0)
+        bar.grid(row=0, column=0, sticky="ew")
+        bar.grid_propagate(False)
+        bar.grid_columnconfigure(1, weight=1)
+
+        # Search entry
+        self.search_var = ctk.StringVar()
+        self.search_var.trace_add("write", lambda *a: self.filter_table())
+        ctk.CTkEntry(
+            bar,
+            placeholder_text="🔍  Filter: Name, Package-ID oder Pfad …",
+            textvariable=self.search_var, height=42, width=420,
+            font=("Segoe UI", 13), corner_radius=21,
+            fg_color=MAIN_BG, border_color=BORDER, border_width=1,
+        ).grid(row=0, column=0, padx=(22, 10), pady=14)
+
+        # Action buttons
+        bf = ctk.CTkFrame(bar, fg_color="transparent")
+        bf.grid(row=0, column=1, sticky="e", padx=18)
+
+        def _btn(text, fg, ho, cmd):
+            ctk.CTkButton(bf, text=text, height=38, font=("Segoe UI", 12),
+                          fg_color=fg, hover_color=ho, corner_radius=10,
+                          command=cmd).pack(side="left", padx=4)
+
+        _btn("Alle wählen",  SIDEBAR_BG, SIDEBAR_HOVER,
+             lambda: self.select_all_monolith(True))
+        _btn("Aufheben",     "#95a5a6",  "#7f8c8d",
+             lambda: self.select_all_monolith(False))
+        _btn("Dubletten",    ACCENT,     "#C94A38",
+             self.select_all_duplicates_monolith)
+        _btn("Löschen",      "#c0392b",  "#922b21",
+             self.delete_physically_monolith)
+        _btn("→ Pipeline",   "#27ae60",  "#1e8449",
+             self.move_to_pipeline_monolith)
+
         self.status_var = ctk.StringVar(value="Bereit.")
-        ctk.CTkLabel(header, textvariable=self.status_var,
-                     font=("Segoe UI", 16, "bold"),
-                     text_color="#2980b9").pack(side="right", padx=50)
+        ctk.CTkLabel(bar, textvariable=self.status_var,
+                     font=("Segoe UI", 12), text_color=TEXT_MUTED).grid(
+            row=0, column=2, padx=(0, 18))
 
-        # 3. TABS
-        self.tabs = ctk.CTkTabview(self, fg_color="white", border_width=1, corner_radius=20)
-        self.tabs.grid(row=1, column=0, padx=30, pady=(10, 5), sticky="nsew")
-        self.tab_cfg  = self.tabs.add(" 1. KONFIGURATION ")
-        self.tab_sel  = self.tabs.add(" 2. ANALYSE-GRID ")
-        self.tab_pipe = self.tabs.add(" 3. PIPELINE-STEUERUNG ")
+    def _build_statusbar(self, parent):
+        """Thin white bar at bottom of main area showing APK statistics."""
+        bar = ctk.CTkFrame(parent, fg_color=CARD_BG, height=34, corner_radius=0)
+        bar.grid(row=2, column=0, sticky="ew")
+        bar.grid_propagate(False)
+        self.stats_var = ctk.StringVar(value="0 APKs | 0 ausgewählt | 0.00 GB total")
+        ctk.CTkLabel(bar, textvariable=self.stats_var,
+                     font=("Segoe UI", 11), text_color=TEXT_MUTED).pack(
+            side="left", padx=20)
 
-        self.setup_tab_config_monolith()
-        self.setup_tab_selection_monolith()
-        self.setup_tab_pipeline_monolith()
+    def _switch_view(self, view_id: str):
+        """Show the requested view frame; highlight the matching nav button."""
+        for name, frame in self._views.items():
+            if name == view_id:
+                frame.grid()
+            else:
+                frame.grid_remove()
+        for name, btn in self._nav_btns.items():
+            if name == view_id:
+                btn.configure(fg_color=SIDEBAR_HOVER, text_color=TEXT_LIGHT)
+            else:
+                btn.configure(fg_color="transparent", text_color=TEXT_MUTED)
+        self._current_view = view_id
 
-    def setup_tab_config_monolith(self):
-        self.tab_cfg.grid_columnconfigure(0, weight=3)
-        self.tab_cfg.grid_columnconfigure(1, weight=1)
-        self.tab_cfg.grid_rowconfigure(0, weight=1)
-        self.tab_cfg.grid_rowconfigure(1, weight=1)
+    # ── VIEWS ─────────────────────────────────────────────────────────────────
 
-        path_frame = ctk.CTkFrame(self.tab_cfg, fg_color="transparent")
-        path_frame.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=25, pady=15)
+    def setup_view_config(self):
+        """Build the Konfiguration view (source paths, exclude paths, patterns)."""
+        view = ctk.CTkFrame(self._content_area, fg_color=MAIN_BG, corner_radius=0)
+        view.grid(row=0, column=0, sticky="nsew")
+        view.grid_remove()
+        view.grid_columnconfigure(0, weight=3)
+        view.grid_columnconfigure(1, weight=1)
+        view.grid_rowconfigure(0, weight=1)
+        view.grid_rowconfigure(1, weight=1)
+        self._views["config"] = view
 
-        # -- SOURCES --
-        ctk.CTkLabel(path_frame, text="Quell-Verzeichnisse (Include +)",
-                     font=("Segoe UI", 20, "bold")).pack(anchor="w", pady=(10, 5))
-        inc_c = ctk.CTkFrame(path_frame, fg_color="transparent")
-        inc_c.pack(fill="both", expand=True)
-        inc_tf = ctk.CTkFrame(inc_c, fg_color="white", border_width=1)
-        inc_tf.pack(side="left", fill="both", expand=True)
-        self.inc_list = ttk.Treeview(inc_tf, columns=("Status", "Path"),
+        # Left: path lists
+        path_f = ctk.CTkFrame(view, fg_color="transparent")
+        path_f.grid(row=0, column=0, rowspan=2, sticky="nsew", padx=(20, 8), pady=15)
+
+        # Include paths
+        ctk.CTkLabel(path_f, text="Quell-Verzeichnisse (Include +)",
+                     font=("Segoe UI", 17, "bold"),
+                     text_color=TEXT_DARK).pack(anchor="w", pady=(8, 4))
+        inc_row = ctk.CTkFrame(path_f, fg_color="transparent")
+        inc_row.pack(fill="both", expand=True)
+        inc_box = ctk.CTkFrame(inc_row, fg_color=CARD_BG, corner_radius=10,
+                               border_width=1, border_color=BORDER)
+        inc_box.pack(side="left", fill="both", expand=True)
+        self.inc_list = ttk.Treeview(inc_box, columns=("Status", "Path"),
                                      show="headings", height=8)
         self.inc_list.heading("Status", text="S")
         self.inc_list.column("Status", width=50, anchor="center")
         self.inc_list.heading("Path", text="Pfad")
-        self.inc_list.column("Path", width=850)
-        inc_vsb = ttk.Scrollbar(inc_tf, orient="vertical", command=self.inc_list.yview)
+        self.inc_list.column("Path", width=800)
+        inc_vsb = ttk.Scrollbar(inc_box, orient="vertical", command=self.inc_list.yview)
         self.inc_list.configure(yscrollcommand=inc_vsb.set)
         self.inc_list.pack(side="left", fill="both", expand=True)
         inc_vsb.pack(side="right", fill="y")
-        inc_btn_f = ctk.CTkFrame(inc_c, fg_color="transparent")
-        inc_btn_f.pack(side="right", fill="y", padx=20)
-        ctk.CTkButton(inc_btn_f, text="Neu", width=110, height=40,
-                      command=lambda: self.smart_path_action("INC", "ADD")).pack(pady=5)
-        ctk.CTkButton(inc_btn_f, text="Edit", width=110, height=40, fg_color="#95a5a6",
-                      command=lambda: self.smart_path_action("INC", "EDIT")).pack(pady=5)
-        ctk.CTkButton(inc_btn_f, text="Del", width=110, height=40, fg_color="#e74c3c",
-                      command=lambda: self.delete_entry("INC")).pack(pady=5)
+        inc_btns = ctk.CTkFrame(inc_row, fg_color="transparent")
+        inc_btns.pack(side="right", fill="y", padx=16)
+        for txt, cmd, fg in [
+            ("Neu",  lambda: self.smart_path_action("INC", "ADD"),  ACCENT2),
+            ("Edit", lambda: self.smart_path_action("INC", "EDIT"), "#95a5a6"),
+            ("Del",  lambda: self.delete_entry("INC"),              ACCENT),
+        ]:
+            ctk.CTkButton(inc_btns, text=txt, width=96, height=36,
+                          fg_color=fg, corner_radius=10,
+                          command=cmd).pack(pady=4)
 
-        # -- EXCLUDE --
-        ctk.CTkLabel(path_frame, text="Pfad-Chirurgie (Exclude -)",
-                     font=("Segoe UI", 20, "bold")).pack(anchor="w", pady=(20, 5))
-        exc_c = ctk.CTkFrame(path_frame, fg_color="transparent")
-        exc_c.pack(fill="both", expand=True)
-        exc_tf = ctk.CTkFrame(exc_c, fg_color="white", border_width=1)
-        exc_tf.pack(side="left", fill="both", expand=True)
-        self.exc_list = ttk.Treeview(exc_tf, columns=("Status", "Path"),
+        # Exclude paths
+        ctk.CTkLabel(path_f, text="Pfad-Chirurgie (Exclude -)",
+                     font=("Segoe UI", 17, "bold"),
+                     text_color=TEXT_DARK).pack(anchor="w", pady=(18, 4))
+        exc_row = ctk.CTkFrame(path_f, fg_color="transparent")
+        exc_row.pack(fill="both", expand=True)
+        exc_box = ctk.CTkFrame(exc_row, fg_color=CARD_BG, corner_radius=10,
+                               border_width=1, border_color=BORDER)
+        exc_box.pack(side="left", fill="both", expand=True)
+        self.exc_list = ttk.Treeview(exc_box, columns=("Status", "Path"),
                                      show="headings", height=8)
         self.exc_list.heading("Status", text="S")
         self.exc_list.column("Status", width=50, anchor="center")
         self.exc_list.heading("Path", text="Pfad")
-        self.exc_list.column("Path", width=850)
-        exc_vsb = ttk.Scrollbar(exc_tf, orient="vertical", command=self.exc_list.yview)
+        self.exc_list.column("Path", width=800)
+        exc_vsb = ttk.Scrollbar(exc_box, orient="vertical", command=self.exc_list.yview)
         self.exc_list.configure(yscrollcommand=exc_vsb.set)
         self.exc_list.pack(side="left", fill="both", expand=True)
         exc_vsb.pack(side="right", fill="y")
-        exc_btn_f = ctk.CTkFrame(exc_c, fg_color="transparent")
-        exc_btn_f.pack(side="right", fill="y", padx=20)
-        ctk.CTkButton(exc_btn_f, text="Neu", width=110, height=40,
-                      command=lambda: self.smart_path_action("EXC", "ADD")).pack(pady=5)
-        ctk.CTkButton(exc_btn_f, text="Edit", width=110, height=40, fg_color="#95a5a6",
-                      command=lambda: self.smart_path_action("EXC", "EDIT")).pack(pady=5)
-        ctk.CTkButton(exc_btn_f, text="Del", width=110, height=40, fg_color="#e74c3c",
-                      command=lambda: self.delete_entry("EXC")).pack(pady=5)
+        exc_btns = ctk.CTkFrame(exc_row, fg_color="transparent")
+        exc_btns.pack(side="right", fill="y", padx=16)
+        for txt, cmd, fg in [
+            ("Neu",  lambda: self.smart_path_action("EXC", "ADD"),  ACCENT2),
+            ("Edit", lambda: self.smart_path_action("EXC", "EDIT"), "#95a5a6"),
+            ("Del",  lambda: self.delete_entry("EXC"),              ACCENT),
+        ]:
+            ctk.CTkButton(exc_btns, text=txt, width=96, height=36,
+                          fg_color=fg, corner_radius=10,
+                          command=cmd).pack(pady=4)
 
-        # -- PATTERNS & ACTIONS --
-        pat_f = ctk.CTkFrame(self.tab_cfg, fg_color="#f9f9f9", corner_radius=20, border_width=1)
-        pat_f.grid(row=0, column=1, sticky="nsew", padx=(0, 30), pady=(45, 15))
-        ctk.CTkLabel(pat_f, text="Globale Muster",
-                     font=("Segoe UI", 18, "bold")).pack(pady=10)
-        self.pat_text = ctk.CTkTextbox(pat_f, width=280, height=250, font=("Consolas", 12))
-        self.pat_text.pack(padx=15, pady=5, fill="both", expand=True)
-        ctk.CTkButton(pat_f, text="Muster speichern", height=35,
-                      command=self.save_patterns).pack(pady=15)
+        # Right: patterns + quick actions
+        right = ctk.CTkFrame(view, fg_color="transparent")
+        right.grid(row=0, column=1, rowspan=2, sticky="nsew", padx=(0, 20), pady=15)
 
-        act_f = ctk.CTkFrame(self.tab_cfg, fg_color="transparent")
-        act_f.grid(row=1, column=1, sticky="nsew", padx=(0, 30), pady=15)
-        ctk.CTkButton(act_f, text="LISTE NEU LADEN", width=250, height=70,
-                      fg_color="#95a5a6", font=("Segoe UI", 15, "bold"),
-                      command=self.load_all_configs).pack(pady=10, fill="x")
-        ctk.CTkButton(act_f, text="SYSTEM-SCAN STARTEN", width=250, height=110,
-                      font=("Segoe UI", 22, "bold"), fg_color="#27ae60",
-                      command=self.start_deep_scan).pack(pady=10, fill="x")
+        pat_card = ctk.CTkFrame(right, fg_color=CARD_BG, corner_radius=16,
+                                border_width=1, border_color=BORDER)
+        pat_card.pack(fill="both", expand=True, pady=(0, 10))
+        ctk.CTkLabel(pat_card, text="Globale Muster",
+                     font=("Segoe UI", 15, "bold"),
+                     text_color=TEXT_DARK).pack(pady=(14, 0))
+        self.pat_text = ctk.CTkTextbox(pat_card, width=240, height=200,
+                                       font=("Consolas", 12),
+                                       fg_color=MAIN_BG, border_width=0)
+        self.pat_text.pack(padx=14, pady=6, fill="both", expand=True)
+        ctk.CTkButton(pat_card, text="Muster speichern", height=34,
+                      fg_color=ACCENT2, hover_color="#2aB09A",
+                      corner_radius=10,
+                      command=self.save_patterns).pack(pady=10)
 
-        # -- FOOTER STATISTICS --
-        self.footer = ctk.CTkFrame(self, height=40, fg_color="#f2f2f2", corner_radius=0)
-        self.footer.grid(row=2, column=0, sticky="ew")
-        self.stats_var = ctk.StringVar(value="0 APKs | 0 ausgewählt | 0.00 GB total")
-        ctk.CTkLabel(self.footer, textvariable=self.stats_var,
-                     font=("Segoe UI", 13)).pack(side="left", padx=25)
+        act_card = ctk.CTkFrame(right, fg_color=CARD_BG, corner_radius=16,
+                                border_width=1, border_color=BORDER)
+        act_card.pack(fill="x")
+        ctk.CTkButton(act_card, text="LISTE NEU LADEN", height=46,
+                      fg_color=SIDEBAR_BG, hover_color=SIDEBAR_HOVER,
+                      corner_radius=12, font=("Segoe UI", 13, "bold"),
+                      command=self.load_all_configs).pack(
+            fill="x", padx=14, pady=(14, 6))
+        ctk.CTkButton(act_card, text="SYSTEM-SCAN STARTEN", height=46,
+                      fg_color=ACCENT, hover_color="#C94A38",
+                      corner_radius=12, font=("Segoe UI", 13, "bold"),
+                      command=self.start_deep_scan).pack(
+            fill="x", padx=14, pady=(0, 14))
 
-    def setup_tab_selection_monolith(self):
-        tools = ctk.CTkFrame(self.tab_sel, fg_color="transparent")
-        tools.pack(fill="x", padx=35, pady=25)
+    def setup_view_dashboard(self):
+        """Build the APK analysis grid (the main working view)."""
+        view = ctk.CTkFrame(self._content_area, fg_color=MAIN_BG, corner_radius=0)
+        view.grid(row=0, column=0, sticky="nsew")
+        view.grid_remove()
+        view.grid_columnconfigure(0, weight=1)
+        view.grid_rowconfigure(0, weight=1)
+        self._views["dashboard"] = view
 
-        self.search_var = ctk.StringVar()
-        self.search_var.trace_add("write", lambda *a: self.filter_table())
-        search_entry = ctk.CTkEntry(
-            tools, placeholder_text="Live-Filter: Name, Package-ID oder Pfad...",
-            textvariable=self.search_var, width=600, height=50, font=("Segoe UI", 14),
-        )
-        search_entry.pack(side="left")
-
-        btn_f = ctk.CTkFrame(tools, fg_color="transparent")
-        btn_f.pack(side="right")
-        ctk.CTkButton(btn_f, text="Alle wählen", width=140, height=50,
-                      fg_color="#34495e",
-                      command=lambda: self.select_all_monolith(True)).pack(side="left", padx=10)
-        ctk.CTkButton(btn_f, text="Auswahl aufheben", width=140, height=50,
-                      fg_color="#95a5a6",
-                      command=lambda: self.select_all_monolith(False)).pack(side="left", padx=10)
-        ctk.CTkButton(btn_f, text="DUBLETTEN MARKIEREN", height=50,
-                      fg_color="#e67e22", font=("Segoe UI", 13, "bold"),
-                      command=self.select_all_duplicates_monolith).pack(side="left", padx=10)
-
-        grid_container = ctk.CTkFrame(self.tab_sel, fg_color="white",
-                                      border_width=1, corner_radius=10)
-        grid_container.pack(fill="both", expand=True, padx=35, pady=5)
+        container = ctk.CTkFrame(view, fg_color=CARD_BG, corner_radius=14,
+                                 border_width=1, border_color=BORDER)
+        container.pack(fill="both", expand=True, padx=20, pady=15)
+        container.grid_columnconfigure(0, weight=1)
+        container.grid_rowconfigure(0, weight=1)
 
         style = ttk.Style()
-        style.configure("Treeview", rowheight=55, font=("Segoe UI", 13))
-        style.configure("Treeview.Heading", font=("Segoe UI", 14, "bold"))
+        style.configure("APK.Treeview",
+                        rowheight=52, font=("Segoe UI", 12),
+                        background=CARD_BG, fieldbackground=CARD_BG,
+                        foreground=TEXT_DARK)
+        style.configure("APK.Treeview.Heading",
+                        font=("Segoe UI", 12, "bold"),
+                        background=MAIN_BG, foreground=TEXT_DARK)
+        style.map("APK.Treeview",
+                  background=[("selected", "#DDEEFF")],
+                  foreground=[("selected", TEXT_DARK)])
 
         cols = ("?", "Status", "App-Name", "ID", "Version", "Größe", "Pfad")
-        self.sel_tree = ttk.Treeview(grid_container, columns=cols,
-                                     show="headings", selectmode="none")
+        self.sel_tree = ttk.Treeview(container, columns=cols,
+                                     show="headings", selectmode="none",
+                                     style="APK.Treeview")
+        col_cfg = {
+            "?":       (60,  "center"),
+            "Status":  (150, "w"),
+            "App-Name":(260, "w"),
+            "ID":      (270, "w"),
+            "Version": (120, "center"),
+            "Größe":   (120, "center"),
+            "Pfad":    (680, "w"),
+        }
         for col in cols:
+            w, anch = col_cfg[col]
             self.sel_tree.heading(col, text=col,
                                   command=lambda c=col: self.sort_column_monolith(c))
-            w = {"?": 70, "Status": 160, "App-Name": 280, "ID": 280,
-                 "Version": 130, "Größe": 130, "Pfad": 700}
-            self.sel_tree.column(
-                col, width=w.get(col, 100),
-                anchor="center" if col in ["?", "Größe", "Version"] else "w",
-            )
+            self.sel_tree.column(col, width=w, anchor=anch)
 
-        vsb = ttk.Scrollbar(grid_container, orient="vertical", command=self.sel_tree.yview)
-        hsb = ttk.Scrollbar(grid_container, orient="horizontal", command=self.sel_tree.xview)
+        vsb = ttk.Scrollbar(container, orient="vertical", command=self.sel_tree.yview)
+        hsb = ttk.Scrollbar(container, orient="horizontal", command=self.sel_tree.xview)
         self.sel_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
         self.sel_tree.grid(row=0, column=0, sticky="nsew")
         vsb.grid(row=0, column=1, sticky="ns")
         hsb.grid(row=1, column=0, sticky="ew")
-        grid_container.grid_columnconfigure(0, weight=1)
-        grid_container.grid_rowconfigure(0, weight=1)
 
         self.sel_tree.bind("<ButtonRelease-1>", self.on_tree_click_monolith)
         self.sel_tree.bind("<Button-3>", self.show_context_menu_monolith)
 
-        action_bar = ctk.CTkFrame(self.tab_sel, fg_color="transparent")
-        action_bar.pack(fill="x", padx=35, pady=30)
-        ctk.CTkButton(action_bar, text="MARKIERTE DATEIEN PHYSISCH LÖSCHEN",
-                      height=70, fg_color="#c0392b", font=("Segoe UI", 16, "bold"),
-                      command=self.delete_physically_monolith).pack(side="left")
-        ctk.CTkButton(action_bar, text="GEWÄHLTE IN PIPELINE ÜBERNEHMEN",
-                      height=70, fg_color="#2ecc71", font=("Segoe UI", 20, "bold"),
-                      command=self.move_to_pipeline_monolith).pack(side="right")
+    def setup_view_pipeline(self):
+        """Build the Pipeline control view (strategy, queue, run/kill)."""
+        view = ctk.CTkFrame(self._content_area, fg_color=MAIN_BG, corner_radius=0)
+        view.grid(row=0, column=0, sticky="nsew")
+        view.grid_remove()
+        self._views["pipeline"] = view
 
-    def setup_tab_pipeline_monolith(self):
-        main = ctk.CTkFrame(self.tab_pipe, fg_color="transparent")
-        main.pack(fill="both", expand=True, padx=45, pady=35)
+        main = ctk.CTkFrame(view, fg_color="transparent")
+        main.pack(fill="both", expand=True, padx=40, pady=30)
 
-        ctk.CTkLabel(main, text="Archivierungs-Strategie wählen:",
-                     font=("Segoe UI", 20, "bold")).pack(anchor="w")
-        strat_frame = ctk.CTkFrame(main, fg_color="#f2f2f2", corner_radius=20, border_width=1)
-        strat_frame.pack(fill="x", pady=20)
+        # Strategy card
+        strat = ctk.CTkFrame(main, fg_color=CARD_BG, corner_radius=16,
+                             border_width=1, border_color=BORDER)
+        strat.pack(fill="x", pady=(0, 14))
+        ctk.CTkLabel(strat, text="Archivierungs-Strategie",
+                     font=("Segoe UI", 16, "bold"),
+                     text_color=TEXT_DARK).pack(anchor="w", padx=20, pady=(14, 6))
+        strat_row = ctk.CTkFrame(strat, fg_color="transparent")
+        strat_row.pack(fill="x", padx=20, pady=(0, 14))
         self.mode_var = ctk.StringVar(value="FULL")
-        strats = [
+        for text, val in [
             ("Vollständig (Logic+UX+Rebuild)", "FULL"),
             ("Nur Design-Ernte",               "UI"),
             ("Nur Code & Forensik",            "CODE"),
             ("Raw (Originalstruktur)",         "RAW"),
-        ]
-        for text, val in strats:
-            ctk.CTkRadioButton(strat_frame, text=text, variable=self.mode_var, value=val,
-                               font=("Segoe UI", 15, "bold")).pack(side="left",
-                                                                   padx=35, pady=30)
+        ]:
+            ctk.CTkRadioButton(strat_row, text=text, variable=self.mode_var,
+                               value=val, font=("Segoe UI", 13),
+                               text_color=TEXT_DARK,
+                               fg_color=ACCENT).pack(side="left", padx=16)
 
+        # Queue card
+        queue_card = ctk.CTkFrame(main, fg_color=CARD_BG, corner_radius=16,
+                                  border_width=1, border_color=BORDER)
+        queue_card.pack(fill="both", expand=True, pady=(0, 14))
+        ctk.CTkLabel(queue_card, text="Aktive Warteschlange",
+                     font=("Segoe UI", 16, "bold"),
+                     text_color=TEXT_DARK).pack(anchor="w", padx=20, pady=(14, 6))
         self.pipe_scroll = ctk.CTkScrollableFrame(
-            main, label_text="Aktive Warteschlange", height=450,
-            label_font=("Segoe UI", 14, "bold"),
-        )
-        self.pipe_scroll.pack(fill="both", expand=True, pady=10)
+            queue_card, fg_color="transparent", height=280)
+        self.pipe_scroll.pack(fill="both", expand=True, padx=16, pady=(0, 14))
 
-        ctrl_frame = ctk.CTkFrame(main, fg_color="transparent")
-        ctrl_frame.pack(pady=40)
+        # Control card
+        ctrl_card = ctk.CTkFrame(main, fg_color=CARD_BG, corner_radius=16,
+                                 border_width=1, border_color=BORDER)
+        ctrl_card.pack(fill="x")
+        ctrl_row = ctk.CTkFrame(ctrl_card, fg_color="transparent")
+        ctrl_row.pack(pady=18, padx=20)
         self.start_btn = ctk.CTkButton(
-            ctrl_frame, text="PIPELINE STARTEN", width=450, height=90,
-            font=("Segoe UI", 24, "bold"), fg_color="#27ae60",
+            ctrl_row, text="PIPELINE STARTEN", width=340, height=64,
+            font=("Segoe UI", 19, "bold"),
+            fg_color="#27ae60", hover_color="#1e8449", corner_radius=14,
             command=self.run_pipeline_monolith,
         )
-        self.start_btn.pack(side="left", padx=20)
-        ctk.CTkButton(ctrl_frame, text="ABBRUCH / KILL", width=220, height=90,
-                      fg_color="#e74c3c", font=("Segoe UI", 18),
-                      command=self.kill_current).pack(side="left", padx=20)
+        self.start_btn.pack(side="left", padx=10)
+        ctk.CTkButton(
+            ctrl_row, text="ABBRUCH / KILL", width=190, height=64,
+            fg_color=ACCENT, hover_color="#C94A38",
+            font=("Segoe UI", 15), corner_radius=14,
+            command=self.kill_current,
+        ).pack(side="left", padx=10)
 
     # =========================================================================
     # APK METADATA
@@ -454,23 +739,24 @@ class APKMasterV59(ctk.CTk):
                         app, pid, ver, code = self.get_apk_metadata(fp)
                         sz = os.path.getsize(fp)
                         sz_mb = sz / (1024 * 1024)
+                        sha = self._apk_sha256(fp)
                         status, tag = "ORIGINAL", ""
                         if pid != "err.apk":
                             if pid in id_map:
-                                if sz in id_map[pid]:
+                                if sha in id_map[pid]:
                                     status, tag = "DUBLETTE", "duplicate"
                                 else:
                                     status, tag = "ANDERE VER.", "version"
-                                id_map[pid].append(sz)
+                                    id_map[pid].append(sha)  # only add truly new hashes
                             else:
-                                id_map[pid] = [sz]
+                                id_map[pid] = [sha]
                         else:
                             status, tag = "UNBEKANNT", "unknown"
                         self.apk_registry.append({
                             "checked": False, "status": status,
                             "app": app, "id": pid, "ver": ver,
                             "code": code, "size_mb": sz_mb,
-                            "path": fp, "tag": tag,
+                            "path": fp, "tag": tag, "sha256": sha,
                         })
         self.after(0, self.update_selection_table_monolith)
 
@@ -498,10 +784,11 @@ class APKMasterV59(ctk.CTk):
                                       f"{pkg.replace('.', '_')}_v{ver}")
             os.makedirs(target_dir, exist_ok=True)
             workspace = os.path.join(target_dir, "_TEMP_WS")
+            apktool_jar = os.path.join(self.script_dir, "apktool.jar")
 
             if self.run_cmd(
-                f'java -Xmx4G -jar apktool.jar d "{apk_p}" -o "{workspace}" -f'
-            ) == 0:
+                ["java", "-Xmx4G", "-jar", apktool_jar, "d", apk_p,
+                 "-o", workspace, "-f"]) == 0:
                 relevant_classes = []
                 if strat == "RAW":
                     self.security_only_scan_monolith(workspace, target_dir)
@@ -512,10 +799,10 @@ class APKMasterV59(ctk.CTk):
                     if strat in ("FULL", "UI"):
                         self.harvest_ux_monolith(workspace, target_dir)
                     if strat == "FULL":
-                        self.run_cmd(
-                            f'java -Xmx4G -jar apktool.jar b "{workspace}"'
-                            f' -o "{target_dir}/rebuilt_v{ver}.apk"'
-                        )
+                        self.run_cmd([
+                            "java", "-Xmx4G", "-jar", apktool_jar, "b", workspace,
+                            "-o", os.path.join(target_dir, f"rebuilt_v{ver}.apk"),
+                        ])
 
                 permissions = self._extract_permissions_from_manifest(workspace)
                 domains = self._extract_network_domains(workspace)
@@ -844,7 +1131,8 @@ class APKMasterV59(ctk.CTk):
             )
         self.sel_tree.tag_configure("duplicate", background="#ffdada")
         self.sel_tree.tag_configure("version",   background="#fff4d1")
-        self.tabs.set(" 2. ANALYSE-GRID ")
+        self._switch_view("dashboard")
+        self._update_sidebar_stats()
         self.update_stats_monolith()
 
     def on_tree_click_monolith(self, event):
@@ -924,8 +1212,9 @@ class APKMasterV59(ctk.CTk):
     # PROCESS RUNNER
     # =========================================================================
 
-    def run_cmd(self, cmd):
-        p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE,
+    def run_cmd(self, args):
+        """Run a subprocess; args must be a list (shell=False prevents injection)."""
+        p = subprocess.Popen(args, shell=False, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, text=True)
         self.current_pid = p.pid
         for line in p.stdout:
@@ -951,7 +1240,7 @@ class APKMasterV59(ctk.CTk):
         self.pipeline_queue.extend(
             [x["path"] for x in self.apk_registry if x["checked"]])
         self.refresh_pipeline_ui()
-        self.tabs.set(" 3. PIPELINE-STEUERUNG ")
+        self._switch_view("pipeline")
 
     def refresh_pipeline_ui(self):
         for w in self.pipe_scroll.winfo_children():
@@ -1023,9 +1312,20 @@ class APKMasterV59(ctk.CTk):
     # =========================================================================
 
     def log(self, msg):
-        if self.log_text:
-            self.log_text.insert("end", f"> {msg}\n")
-            self.log_text.see("end")
+        """Thread-safe: puts message on queue; drained into the widget by _drain_log."""
+        self._log_queue.put(msg)
+
+    def _drain_log(self):
+        """Consume queued log messages in the main thread (called via after())."""
+        while not self._log_queue.empty():
+            try:
+                msg = self._log_queue.get_nowait()
+                if self.log_text:
+                    self.log_text.insert("end", f"> {msg}\n")
+                    self.log_text.see("end")
+            except queue.Empty:
+                break
+        self.after(100, self._drain_log)
 
     # =========================================================================
     # PATH MANAGEMENT

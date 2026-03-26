@@ -1,0 +1,6 @@
+__pycache__/
+*.pyc
+sources.txt
+exclude_patterns.txt
+MY_APP_LIBRARY/
+
