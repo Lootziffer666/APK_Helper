@@ -42,6 +42,12 @@ MY_APP_LIBRARY/<pkg>_v<ver>/
 | **Netzwerk** | Deduplicated domains; 📢 Ads/Tracking flagged separately |
 | **Threat-Hinweise** | Count of smali files matching threat signatures |
 
+## Comparison with other tools
+
+See [COMPARISON.md](COMPARISON.md) for a detailed feature matrix comparing APK Helper with
+MobSF, Androguard, JADX, apktool, and APKDeepLens, including best-practice notes and a
+verdict on whether an existing tool can replace it.
+
 ## Dependencies
 
 * [customtkinter](https://github.com/TomSchimansky/CustomTkinter) – GUI framework
