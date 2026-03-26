@@ -19,3 +19,4 @@ build = ["pyinstaller>=6.0"]
 
 [project.scripts]
 apk-helper = "apk_master:main"
+afkb = "afkb:main"

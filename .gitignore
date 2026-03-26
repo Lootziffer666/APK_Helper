@@ -3,4 +3,5 @@ __pycache__/
 sources.txt
 exclude_patterns.txt
 MY_APP_LIBRARY/
+afkb_index.db
 

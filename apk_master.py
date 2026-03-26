@@ -902,6 +902,7 @@ class APKMasterV59(ctk.CTk):
                        self.status_var.set(f"Pipeline {p}% – {n}"))
 
             ext_meta = self.get_apk_extended_metadata(apk_p)
+            apk_hash = self._apk_sha256(apk_p)
 
             target_dir = os.path.join(self.library_dir,
                                       f"{pkg.replace('.', '_')}_v{ver}")
@@ -948,6 +949,7 @@ class APKMasterV59(ctk.CTk):
                     res_inventory=res_inventory,
                     layout_count=layout_count,
                     components=components,
+                    apk_hash=apk_hash,
                 )
                 if strat != "RAW":
                     shutil.rmtree(workspace, ignore_errors=True)
@@ -1279,8 +1281,9 @@ class APKMasterV59(ctk.CTk):
                                    domains=None, *, threat_details=None,
                                    ext_meta=None, sdk_inventory=None,
                                    code_stats=None, res_inventory=None,
-                                   layout_count=0, components=None):
-        """Write Overview.md + Overview.json with full Knowledge-Base summary."""
+                                   layout_count=0, components=None,
+                                   apk_hash=None):
+        """Write Overview.md + Overview.json + metadata.json (KB summary)."""
         if relevant_classes is None:
             relevant_classes = []
         if permissions is None:
@@ -1520,6 +1523,42 @@ class APKMasterV59(ctk.CTk):
         with open(out_json, "w", encoding="utf-8") as fh:
             json.dump(report_data, fh, indent=2, ensure_ascii=False)
         self.log(f"Overview.json erstellt: {out_json}")
+
+        # --- Write metadata.json (AFKB-compatible sidecar) ---
+        sdk_inv = sdk_inventory or {}
+        found_sdk = sorted(
+            (k.replace("/", ".").strip(".") for k in sdk_inv),
+            key=lambda s: sdk_inv.get(s.replace(".", "/"), 0),
+            reverse=True,
+        )
+        total_hits = sum(
+            len(v) for v in threat_details.items() if isinstance(v, list)
+        ) if threat_details else 0
+        # Fallback: count from threats dict values
+        if not total_hits and threat_details:
+            total_hits = sum(
+                len(v) if isinstance(v, list) else int(v)
+                for v in threat_details.values()
+            )
+        threat_score = min(10.0, round(total_hits / 5 + len(critical) * 0.5, 1))
+
+        metadata = {
+            "app_name": name,
+            "package_id": pkg,
+            "version_name": ver,
+            "version_code": int(code) if str(code).isdigit() else 0,
+            "sha256": apk_hash or "",
+            "threat_score": threat_score,
+            "found_sdk": found_sdk,
+            "heuristic_hits": {
+                cat: files if isinstance(files, list) else []
+                for cat, files in threat_details.items()
+            },
+        }
+        out_meta = os.path.join(target, "metadata.json")
+        with open(out_meta, "w", encoding="utf-8") as fh:
+            json.dump(metadata, fh, indent=2, ensure_ascii=False)
+        self.log(f"metadata.json erstellt: {out_meta}")
 
     # =========================================================================
     # TABLE / GRID
