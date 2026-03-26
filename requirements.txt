@@ -1,0 +1,3 @@
+customtkinter>=5.2.0
+psutil>=5.9.0
+androguard>=3.3.5
