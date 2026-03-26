@@ -147,7 +147,7 @@ class APKMasterV59(ctk.CTk):
 
     def __init__(self):
         super().__init__()
-        self.title("APK Master V59")
+        self.title("APK Master")
         self.geometry("1600x1000")
 
         # --- PATHS & PERSISTENCE ---
@@ -165,6 +165,9 @@ class APKMasterV59(ctk.CTk):
         self.is_running = False
         self.current_pid = None
         self.log_text = None  # Safety-Init: must exist before load_all_configs
+        self._scan_cancel = False
+        self._scan_paused = False
+        self.results_file = os.path.join(self.script_dir, "scan_results.json")
 
         self.sort_states = {
             "?": True, "Status": True, "App-Name": True,
@@ -212,6 +215,8 @@ class APKMasterV59(ctk.CTk):
         self.setup_ui()
         self.init_system()
         self.load_all_configs()
+        self._load_persisted_results()
+        self._setup_drag_and_drop()
         self._drain_log()
 
     # =========================================================================
@@ -360,8 +365,6 @@ class APKMasterV59(ctk.CTk):
         # Title
         hdr = ctk.CTkFrame(sb, fg_color="transparent")
         hdr.grid(row=0, column=0, sticky="ew", padx=24, pady=(32, 0))
-        ctk.CTkLabel(hdr, text="Welcome to",
-                     font=("Segoe UI", 12), text_color=TEXT_MUTED).pack(anchor="w")
         ctk.CTkLabel(hdr, text="APK Master",
                      font=("Segoe UI", 24, "bold"),
                      text_color=TEXT_LIGHT).pack(anchor="w")
@@ -387,7 +390,7 @@ class APKMasterV59(ctk.CTk):
         leg = ctk.CTkFrame(info, fg_color="transparent")
         leg.pack(anchor="w", pady=(8, 16))
         self._legend_dot(leg, ACCENT,  "Genutzt")
-        self._legend_dot(leg, ACCENT2, "Verfügbar")
+        self._legend_dot(leg, ACCENT2, "Verfügbar (Speicher)")
         self._draw_donut(0, 1)
 
         # Separator
@@ -422,7 +425,26 @@ class APKMasterV59(ctk.CTk):
             font=("Segoe UI", 13, "bold"),
             fg_color=ACCENT, hover_color="#C94A38", corner_radius=14,
             command=self.start_deep_scan,
-        ).grid(row=5, column=0, sticky="ew", padx=16, pady=(0, 24))
+        ).grid(row=5, column=0, sticky="ew", padx=16, pady=(0, 4))
+
+        # Pause / Cancel row
+        scan_ctrl = ctk.CTkFrame(sb, fg_color="transparent")
+        scan_ctrl.grid(row=6, column=0, sticky="ew", padx=16, pady=(0, 24))
+        scan_ctrl.grid_columnconfigure(0, weight=1)
+        scan_ctrl.grid_columnconfigure(1, weight=1)
+        self._pause_btn = ctk.CTkButton(
+            scan_ctrl, text="⏸ Pause", height=36,
+            font=("Segoe UI", 11), fg_color="#95a5a6",
+            hover_color="#7f8c8d", corner_radius=10,
+            command=self._toggle_scan_pause,
+        )
+        self._pause_btn.grid(row=0, column=0, sticky="ew", padx=(0, 3))
+        ctk.CTkButton(
+            scan_ctrl, text="✖ Abbrechen", height=36,
+            font=("Segoe UI", 11), fg_color="#c0392b",
+            hover_color="#922b21", corner_radius=10,
+            command=self._cancel_scan,
+        ).grid(row=0, column=1, sticky="ew", padx=(3, 0))
 
     def _legend_dot(self, parent, color, label):
         """Coloured circle + text legend entry."""
@@ -583,6 +605,7 @@ class APKMasterV59(ctk.CTk):
             ("Neu",  lambda: self.smart_path_action("INC", "ADD"),  ACCENT2),
             ("Edit", lambda: self.smart_path_action("INC", "EDIT"), "#95a5a6"),
             ("Del",  lambda: self.delete_entry("INC"),              ACCENT),
+            ("APK-Dateien…", self._add_apk_files,                   SIDEBAR_BG),
         ]:
             ctk.CTkButton(inc_btns, text=txt, width=96, height=36,
                           fg_color=fg, corner_radius=10,
@@ -826,53 +849,158 @@ class APKMasterV59(ctk.CTk):
         if not self.include_paths:
             messagebox.showwarning("Fehler", "Keine Quellen definiert.")
             return
-        self.status_var.set("Deep Scan läuft...")
-        self.log("Starte systemweite Forensik-Analyse...")
+        self._scan_cancel = False
+        self._scan_paused = False
+        self._pause_btn.configure(text="⏸ Pause")
+        self.status_var.set("Scan startet...")
+        self.log("═══ Starte systemweite Forensik-Analyse ═══")
         threading.Thread(target=self.logic_deep_scan_monolith, daemon=True).start()
 
     def logic_deep_scan_monolith(self):
-        self.apk_registry = []
+        # Build lookup from previous scan for change detection (mtime / size)
+        old_by_path = {}
+        for it in self.apk_registry:
+            old_by_path[it["path"]] = it
+
+        new_registry = []
         id_map = {}
-        norm_exc = [p.lower() for p in self.exclude_paths]
+        norm_exc = [os.path.normpath(p).lower() for p in self.exclude_paths]
         patterns = [p.strip().lower()
                     for p in self.pat_text.get("1.0", "end").split("\n") if p.strip()]
 
-        for src in self.include_paths:
+        total_sources = len(self.include_paths)
+        scanned = 0
+        reused = 0
+        errors = 0
+
+        for src_idx, src in enumerate(self.include_paths, 1):
+            if self._scan_cancel:
+                self.log("⚠ Scan abgebrochen.")
+                break
+
+            self.log(f"\n── Durchsuche Quelle {src_idx}/{total_sources}: \"{src}\" ──")
+            self.after(0, lambda s=src_idx, t=total_sources, p=src:
+                       self.status_var.set(
+                           f"Durchsuche Quelle {s}/{t}: {os.path.basename(p)}…"))
+
             if not os.path.exists(src):
-                self.log(f"Offline: {src}")
+                self.log(f"  ✗ Quelle offline/nicht erreichbar: {src}")
+                errors += 1
                 continue
+
             for root, dirs, files in os.walk(src):
+                if self._scan_cancel:
+                    break
+
+                # Honour pause
+                while self._scan_paused and not self._scan_cancel:
+                    time.sleep(0.2)
+
                 dirs[:] = [
                     d for d in dirs
-                    if os.path.normpath(os.path.join(root, d)).lower() not in norm_exc
+                    if os.path.normpath(os.path.join(root, d)).lower()
+                    not in norm_exc
                 ]
                 dirs[:] = [d for d in dirs
                            if not any(p in d.lower() for p in patterns)]
-                for f in files:
-                    if f.lower().endswith(".apk"):
-                        fp = os.path.normpath(os.path.join(root, f))
-                        app, pid, ver, code = self.get_apk_metadata(fp)
-                        sz = os.path.getsize(fp)
-                        sz_mb = sz / (1024 * 1024)
-                        sha = self._apk_sha256(fp)
-                        status, tag = "ORIGINAL", ""
+
+                apk_files = [f for f in files if f.lower().endswith(".apk")]
+                if not apk_files:
+                    continue
+
+                for f in apk_files:
+                    if self._scan_cancel:
+                        break
+                    while self._scan_paused and not self._scan_cancel:
+                        time.sleep(0.2)
+
+                    fp = os.path.normpath(os.path.join(root, f))
+
+                    try:
+                        stat = os.stat(fp)
+                        sz = stat.st_size
+                        mtime = stat.st_mtime
+                    except OSError:
+                        self.log(f"  ✗ Fehler beim Lesen: {f}")
+                        errors += 1
+                        continue
+
+                    # Change detection: reuse cached entry if unchanged
+                    cached = old_by_path.get(fp)
+                    if (cached
+                            and cached.get("_mtime") == mtime
+                            and cached.get("_size") == sz):
+                        # File unchanged – reuse metadata
+                        new_registry.append(cached)
+                        pid = cached["id"]
+                        sha = cached["sha256"]
                         if pid != "err.apk":
-                            if pid in id_map:
-                                if sha in id_map[pid]:
-                                    status, tag = "DUBLETTE", "duplicate"
-                                else:
-                                    status, tag = "ANDERE VER.", "version"
-                                    id_map[pid].append(sha)  # only add truly new hashes
+                            id_map.setdefault(pid, [])
+                            if sha not in id_map[pid]:
+                                id_map[pid].append(sha)
+                        reused += 1
+                        continue
+
+                    # New or changed file – extract metadata
+                    self.log(f"  🔍 Analysiere APK: \"{f}\"")
+                    self.after(0, lambda n=f:
+                               self.status_var.set(f"Analysiere: {n}"))
+
+                    app, pid, ver, code = self.get_apk_metadata(fp)
+                    sz_mb = sz / (1024 * 1024)
+                    sha = self._apk_sha256(fp)
+                    status, tag = "ORIGINAL", ""
+                    if pid != "err.apk":
+                        if pid in id_map:
+                            if sha in id_map[pid]:
+                                status, tag = "DUBLETTE", "duplicate"
                             else:
-                                id_map[pid] = [sha]
+                                status, tag = "ANDERE VER.", "version"
+                                id_map[pid].append(sha)
                         else:
-                            status, tag = "UNBEKANNT", "unknown"
-                        self.apk_registry.append({
-                            "checked": False, "status": status,
-                            "app": app, "id": pid, "ver": ver,
-                            "code": code, "size_mb": sz_mb,
-                            "path": fp, "tag": tag, "sha256": sha,
-                        })
+                            id_map[pid] = [sha]
+                    else:
+                        status, tag = "UNBEKANNT", "unknown"
+
+                    new_registry.append({
+                        "checked": False, "status": status,
+                        "app": app, "id": pid, "ver": ver,
+                        "code": code, "size_mb": sz_mb,
+                        "path": fp, "tag": tag, "sha256": sha,
+                        "_mtime": mtime, "_size": sz,
+                    })
+                    scanned += 1
+
+        # Recalculate duplicate/version status across the entire registry
+        id_map_final = {}
+        for it in new_registry:
+            pid = it["id"]
+            sha = it["sha256"]
+            if pid == "err.apk":
+                it["status"], it["tag"] = "UNBEKANNT", "unknown"
+                continue
+            if pid in id_map_final:
+                if sha in id_map_final[pid]:
+                    it["status"], it["tag"] = "DUBLETTE", "duplicate"
+                else:
+                    it["status"], it["tag"] = "ANDERE VER.", "version"
+                    id_map_final[pid].append(sha)
+            else:
+                id_map_final[pid] = [sha]
+                it["status"], it["tag"] = "ORIGINAL", ""
+
+        self.apk_registry = new_registry
+
+        # Persist results
+        self._save_scan_results()
+
+        summary = (f"Scan beendet: {len(new_registry)} APKs gefunden "
+                   f"({scanned} neu analysiert, {reused} aus Cache")
+        if errors:
+            summary += f", {errors} Fehler"
+        summary += ")."
+        self.log(f"\n═══ {summary} ═══")
+        self.after(0, lambda: self.status_var.set(summary))
         self.after(0, self.update_selection_table_monolith)
 
     # =========================================================================
@@ -1762,6 +1890,128 @@ class APKMasterV59(ctk.CTk):
             for p in paths:
                 status = "✓" if os.path.exists(p) else "✗"
                 tree.insert("", "end", values=(status, p))
+
+    # =========================================================================
+    # SCAN CONTROL (Pause / Cancel)
+    # =========================================================================
+
+    def _toggle_scan_pause(self):
+        """Toggle scan pause state."""
+        self._scan_paused = not self._scan_paused
+        if self._scan_paused:
+            self._pause_btn.configure(text="▶ Weiter")
+            self.status_var.set("Scan pausiert.")
+            self.log("⏸ Scan pausiert.")
+        else:
+            self._pause_btn.configure(text="⏸ Pause")
+            self.status_var.set("Scan fortgesetzt…")
+            self.log("▶ Scan fortgesetzt.")
+
+    def _cancel_scan(self):
+        """Cancel the running scan."""
+        self._scan_cancel = True
+        self._scan_paused = False
+        self._pause_btn.configure(text="⏸ Pause")
+        self.status_var.set("Scan wird abgebrochen…")
+        self.log("✖ Scan-Abbruch angefordert.")
+
+    # =========================================================================
+    # RESULT PERSISTENCE
+    # =========================================================================
+
+    def _save_scan_results(self):
+        """Persist scan results to disk so they survive restarts."""
+        try:
+            serialisable = []
+            for it in self.apk_registry:
+                entry = dict(it)
+                serialisable.append(entry)
+            with open(self.results_file, "w", encoding="utf-8") as fh:
+                json.dump(serialisable, fh, ensure_ascii=False, indent=1)
+        except Exception as e:
+            self.log(f"Fehler beim Speichern der Ergebnisse: {e}")
+
+    def _load_persisted_results(self):
+        """Reload previous scan results from disk."""
+        if not os.path.exists(self.results_file):
+            return
+        try:
+            with open(self.results_file, "r", encoding="utf-8") as fh:
+                data = json.load(fh)
+            if isinstance(data, list) and data:
+                self.apk_registry = data
+                self.log(f"Vorherige Ergebnisse geladen: {len(data)} APKs.")
+                self.after(0, self.update_selection_table_monolith)
+        except Exception as e:
+            self.log(f"Fehler beim Laden der Ergebnisse: {e}")
+
+    # =========================================================================
+    # DRAG AND DROP
+    # =========================================================================
+
+    def _setup_drag_and_drop(self):
+        """Try to enable native drag-and-drop support (requires tkdnd)."""
+        try:
+            self.tk.call('package', 'require', 'tkdnd')
+            drop_cmd = self.register(self._handle_drop_tcl)
+            self.tk.call('tkdnd::drop_target', 'register', '.', 'DND_Files')
+            self.tk.eval(
+                'bind . <<Drop:DND_Files>> {after idle [list %s %%D]}' % drop_cmd)
+            self.log("Drag & Drop aktiviert.")
+        except Exception:
+            self.log("Hinweis: Drag & Drop nicht verfügbar (tkdnd nicht installiert).")
+
+    def _handle_drop_tcl(self, data):
+        """Handle files/folders dropped onto the window."""
+        try:
+            paths = self.tk.splitlist(data)
+        except Exception:
+            paths = [data]
+        added = 0
+        for raw_path in paths:
+            p = raw_path.strip('{}')
+            if os.path.isdir(p):
+                cp = os.path.normpath(p)
+                if cp not in self.include_paths:
+                    self.include_paths.append(cp)
+                    self.log(f"Quelle per Drag & Drop hinzugefügt: {cp}")
+                    added += 1
+            elif p.lower().endswith('.apk'):
+                parent = os.path.normpath(os.path.dirname(p))
+                if parent not in self.include_paths:
+                    self.include_paths.append(parent)
+                    self.log(f"Quelle per Drag & Drop hinzugefügt: {parent}")
+                    added += 1
+        if added:
+            self.save_all_to_txt()
+            self.refresh_config_ui()
+
+    # =========================================================================
+    # APK FILE SELECTION (individual files with multi-select)
+    # =========================================================================
+
+    def _add_apk_files(self):
+        """Open a file dialog to select individual APK files (multi-select).
+
+        Adds the parent directory of each selected file as a source path.
+        """
+        files = filedialog.askopenfilenames(
+            title="APK-Dateien auswählen",
+            filetypes=[("APK-Dateien", "*.apk"), ("Alle Dateien", "*.*")],
+        )
+        if not files:
+            return
+        added = set()
+        for fp in files:
+            parent = os.path.normpath(os.path.dirname(fp))
+            if parent not in self.include_paths:
+                self.include_paths.append(parent)
+                added.add(parent)
+        if added:
+            for p in added:
+                self.log(f"Quelle hinzugefügt (via Datei-Auswahl): {p}")
+            self.save_all_to_txt()
+            self.refresh_config_ui()
 
     # =========================================================================
     # LOG
