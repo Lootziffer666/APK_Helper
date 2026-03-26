@@ -1,7 +1,13 @@
 import customtkinter as ctk
 from tkinter import filedialog, messagebox, ttk, Menu
-import os, threading, subprocess, zipfile, shutil, psutil, re, time
+import os, threading, subprocess, zipfile, shutil, psutil, re, time, hashlib, queue
 import xml.etree.ElementTree as ET
+
+try:
+    import yaml
+    YAML_AVAILABLE = True
+except ImportError:
+    YAML_AVAILABLE = False
 
 # --- FORENSIC ENGINE IMPORT ---
 try:
@@ -91,13 +97,58 @@ class APKMasterV59(ctk.CTk):
         self.current_pid = None
         self.log_text = None  # Safety-Init: must exist before load_all_configs
 
+        self._log_queue = queue.Queue()
+
         self.sort_states = {
             "?": True, "Status": True, "App-Name": True,
             "ID": True, "Version": True, "Größe": True, "Pfad": True,
         }
 
         # --- THREAT DATABASE ---
-        self.THREATS = {
+        self.THREATS = self._load_threats()
+
+        # --- SDK SIGNATURES ---
+        self.SDK_PATTERNS = [
+            "com/google", "com/facebook", "com/appsflyer", "com/unity3d",
+            "com/adjust", "com/firebase", "com/amazon", "com/mbridge",
+            "io/fabric", "com/applovin", "com/ironsource", "com/vungle",
+            "com/flurry", "com/tapjoy", "com/yandex/metrica", "com/onesignal",
+        ]
+
+        self.setup_ui()
+        self.init_system()
+        self.load_all_configs()
+        self._drain_log()
+
+    # =========================================================================
+    # INIT
+    # =========================================================================
+
+    def init_system(self):
+        if not os.path.exists(self.library_dir):
+            os.makedirs(self.library_dir)
+        for f in [self.config_file, self.patterns_file]:
+            if not os.path.exists(f):
+                with open(f, "w", encoding="utf-8") as fh:
+                    fh.write("# APK Master Configuration\n")
+
+    def _load_threats(self):
+        """Load threat signatures from threats.yaml; fall back to built-in defaults."""
+        threats_path = os.path.join(self.script_dir, "threats.yaml")
+        if YAML_AVAILABLE and os.path.exists(threats_path):
+            try:
+                with open(threats_path, "r", encoding="utf-8") as fh:
+                    data = yaml.safe_load(fh)
+                if isinstance(data, dict):
+                    return {k: list(v) for k, v in data.items()}
+            except Exception:
+                pass
+        return self._default_threats()
+
+    @staticmethod
+    def _default_threats():
+        """Built-in threat signatures used when threats.yaml is absent or unreadable."""
+        return {
             "IDENTITY": [
                 "getDeviceId", "getSimSerialNumber", "getSubscriberId",
                 "getLine1Number", "INSTALL_REFERRER", "getImei", "getMeid",
@@ -137,29 +188,17 @@ class APKMasterV59(ctk.CTk):
             ],
         }
 
-        # --- SDK SIGNATURES ---
-        self.SDK_PATTERNS = [
-            "com/google", "com/facebook", "com/appsflyer", "com/unity3d",
-            "com/adjust", "com/firebase", "com/amazon", "com/mbridge",
-            "io/fabric", "com/applovin", "com/ironsource", "com/vungle",
-            "com/flurry", "com/tapjoy", "com/yandex/metrica", "com/onesignal",
-        ]
-
-        self.setup_ui()
-        self.init_system()
-        self.load_all_configs()
-
-    # =========================================================================
-    # INIT
-    # =========================================================================
-
-    def init_system(self):
-        if not os.path.exists(self.library_dir):
-            os.makedirs(self.library_dir)
-        for f in [self.config_file, self.patterns_file]:
-            if not os.path.exists(f):
-                with open(f, "w", encoding="utf-8") as fh:
-                    fh.write("# APK Master Configuration\n")
+    @staticmethod
+    def _apk_sha256(path):
+        """Compute SHA-256 hash of a file for reliable duplicate detection."""
+        h = hashlib.sha256()
+        try:
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    h.update(chunk)
+        except OSError:
+            pass
+        return h.hexdigest()
 
     # =========================================================================
     # UI SETUP
@@ -454,23 +493,24 @@ class APKMasterV59(ctk.CTk):
                         app, pid, ver, code = self.get_apk_metadata(fp)
                         sz = os.path.getsize(fp)
                         sz_mb = sz / (1024 * 1024)
+                        sha = self._apk_sha256(fp)
                         status, tag = "ORIGINAL", ""
                         if pid != "err.apk":
                             if pid in id_map:
-                                if sz in id_map[pid]:
+                                if sha in id_map[pid]:
                                     status, tag = "DUBLETTE", "duplicate"
                                 else:
                                     status, tag = "ANDERE VER.", "version"
-                                id_map[pid].append(sz)
+                                id_map[pid].append(sha)
                             else:
-                                id_map[pid] = [sz]
+                                id_map[pid] = [sha]
                         else:
                             status, tag = "UNBEKANNT", "unknown"
                         self.apk_registry.append({
                             "checked": False, "status": status,
                             "app": app, "id": pid, "ver": ver,
                             "code": code, "size_mb": sz_mb,
-                            "path": fp, "tag": tag,
+                            "path": fp, "tag": tag, "sha256": sha,
                         })
         self.after(0, self.update_selection_table_monolith)
 
@@ -498,10 +538,11 @@ class APKMasterV59(ctk.CTk):
                                       f"{pkg.replace('.', '_')}_v{ver}")
             os.makedirs(target_dir, exist_ok=True)
             workspace = os.path.join(target_dir, "_TEMP_WS")
+            apktool_jar = os.path.join(self.script_dir, "apktool.jar")
 
             if self.run_cmd(
-                f'java -Xmx4G -jar apktool.jar d "{apk_p}" -o "{workspace}" -f'
-            ) == 0:
+                ["java", "-Xmx4G", "-jar", apktool_jar, "d", apk_p,
+                 "-o", workspace, "-f"]) == 0:
                 relevant_classes = []
                 if strat == "RAW":
                     self.security_only_scan_monolith(workspace, target_dir)
@@ -512,10 +553,10 @@ class APKMasterV59(ctk.CTk):
                     if strat in ("FULL", "UI"):
                         self.harvest_ux_monolith(workspace, target_dir)
                     if strat == "FULL":
-                        self.run_cmd(
-                            f'java -Xmx4G -jar apktool.jar b "{workspace}"'
-                            f' -o "{target_dir}/rebuilt_v{ver}.apk"'
-                        )
+                        self.run_cmd([
+                            "java", "-Xmx4G", "-jar", apktool_jar, "b", workspace,
+                            "-o", os.path.join(target_dir, f"rebuilt_v{ver}.apk"),
+                        ])
 
                 permissions = self._extract_permissions_from_manifest(workspace)
                 domains = self._extract_network_domains(workspace)
@@ -924,8 +965,9 @@ class APKMasterV59(ctk.CTk):
     # PROCESS RUNNER
     # =========================================================================
 
-    def run_cmd(self, cmd):
-        p = subprocess.Popen(cmd, shell=True, stdout=subprocess.PIPE,
+    def run_cmd(self, args):
+        """Run a subprocess; args must be a list (shell=False prevents injection)."""
+        p = subprocess.Popen(args, shell=False, stdout=subprocess.PIPE,
                              stderr=subprocess.STDOUT, text=True)
         self.current_pid = p.pid
         for line in p.stdout:
@@ -1023,9 +1065,20 @@ class APKMasterV59(ctk.CTk):
     # =========================================================================
 
     def log(self, msg):
-        if self.log_text:
-            self.log_text.insert("end", f"> {msg}\n")
-            self.log_text.see("end")
+        """Thread-safe: puts message on queue; drained into the widget by _drain_log."""
+        self._log_queue.put(msg)
+
+    def _drain_log(self):
+        """Consume queued log messages in the main thread (called via after())."""
+        while not self._log_queue.empty():
+            try:
+                msg = self._log_queue.get_nowait()
+                if self.log_text:
+                    self.log_text.insert("end", f"> {msg}\n")
+                    self.log_text.see("end")
+            except queue.Empty:
+                break
+        self.after(100, self._drain_log)
 
     # =========================================================================
     # PATH MANAGEMENT

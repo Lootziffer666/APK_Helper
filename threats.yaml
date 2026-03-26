@@ -1,0 +1,85 @@
+# APK Master – Threat Signatures
+# Edit this file to add or remove signatures without touching the source code.
+# Changes take effect on the next application startup.
+# Each category contains a list of strings searched for in decompiled Smali files.
+
+IDENTITY:
+  - getDeviceId
+  - getSimSerialNumber
+  - getSubscriberId
+  - getLine1Number
+  - INSTALL_REFERRER
+  - getImei
+  - getMeid
+  - getSerial
+  - getAccounts
+  - getAccountsByType
+
+SPY:
+  - "MediaRecorder;->start"
+  - "Camera;->takePicture"
+  - "AudioSource;->MIC"
+  - getLastKnownLocation
+  - requestLocationUpdates
+  - onLocationChanged
+  - getLatitude
+  - getLongitude
+  - getAccuracy
+  - CellInfo
+
+SHELL:
+  - "Runtime;->exec"
+  - "ProcessBuilder;->start"
+  - "chmod "
+  - "su -c"
+  - "mount -o remount"
+  - /system/bin/sh
+  - /system/xbin/su
+  - LD_PRELOAD
+  - libspy
+  - insmod
+  - rmmod
+
+SMS:
+  - SMS_RECEIVED
+  - pdus
+  - SEND_SMS
+  - RECEIVE_WAP_PUSH
+  - SMS_SEND_ACTION
+  - android.provider.Telephony.SMS_RECEIVED
+  - SMS_BODY
+  - READ_SMS
+  - WRITE_SMS
+
+NETWORK:
+  - HttpURLConnection
+  - DefaultHttpClient
+  - "Socket;->connect"
+  - getServerSocket
+  - isNetworkConnected
+  - getWifiState
+  - getScanResults
+  - "Proxy;->getAddress"
+
+SYSTEM:
+  - getRunningAppProcesses
+  - getRecentTasks
+  - killBackgroundProcesses
+  - reboot
+  - ACTION_SHUTDOWN
+  - WRITE_SECURE_SETTINGS
+  - INSTALL_PACKAGES
+
+CRYPTO:
+  - AES/CBC/PKCS5Padding
+  - SecretKeySpec
+  - IvParameterSpec
+  - "MessageDigest;->getInstance"
+  - MD5
+  - SHA-1
+
+PERSISTENCE:
+  - RECEIVE_BOOT_COMPLETED
+  - ACTION_EXTERNAL_APPLICATIONS_AVAILABLE
+  - QUICKBOOT_POWERON
+  - "AlarmManager;->setRepeating"
