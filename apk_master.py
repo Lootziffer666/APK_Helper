@@ -389,8 +389,8 @@ class APKMasterV59(ctk.CTk):
                      text_color=TEXT_MUTED).pack(anchor="w")
         leg = ctk.CTkFrame(info, fg_color="transparent")
         leg.pack(anchor="w", pady=(8, 16))
-        self._legend_dot(leg, ACCENT,  "Genutzt")
-        self._legend_dot(leg, ACCENT2, "Verfügbar (Speicher)")
+        self._legend_dot(leg, ACCENT,  "Duplikate")
+        self._legend_dot(leg, ACCENT2, "Originale")
         self._draw_donut(0, 1)
 
         # Separator
@@ -483,16 +483,12 @@ class APKMasterV59(ctk.CTk):
         """Refresh sidebar donut chart and counters after a scan."""
         total_apks = len(self.apk_registry)
         total_gb   = sum(x["size_mb"] for x in self.apk_registry) / 1024
-        try:
-            disk       = psutil.disk_usage(self.script_dir)
-            disk_total = disk.total / (1024 ** 3)
-            disk_used  = disk.used  / (1024 ** 3)
-        except Exception:
-            disk_total = max(total_gb * 10, 1)
-            disk_used  = total_gb
+        dup_gb     = sum(x["size_mb"] for x in self.apk_registry
+                         if x.get("tag") == "duplicate") / 1024
+        orig_gb    = total_gb - dup_gb
         self._stat_size_var.set(f"{total_gb:.1f} GB")
         self._stat_count_var.set(f"Total: {total_apks} APKs")
-        self._draw_donut(disk_used, disk_total)
+        self._draw_donut(dup_gb, max(total_gb, 0.001))  # min avoids /0 in donut
 
     # ── TOP BAR ───────────────────────────────────────────────────────────────
 
