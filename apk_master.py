@@ -1958,14 +1958,17 @@ class APKMasterV59(ctk.CTk):
             self.tk.eval(
                 'bind . <<Drop:DND_Files>> {after idle [list %s %%D]}' % drop_cmd)
             self.log("Drag & Drop aktiviert.")
-        except Exception:
+        except tk.TclError:
             self.log("Hinweis: Drag & Drop nicht verfügbar (tkdnd nicht installiert).")
+        except Exception as e:
+            self.log(f"Hinweis: Drag & Drop konnte nicht aktiviert werden: {e}")
 
     def _handle_drop_tcl(self, data):
         """Handle files/folders dropped onto the window."""
         try:
             paths = self.tk.splitlist(data)
-        except Exception:
+        except (tk.TclError, ValueError):
+            self.log(f"Drag & Drop: Konnte Daten nicht verarbeiten.")
             paths = [data]
         added = 0
         for raw_path in paths:
