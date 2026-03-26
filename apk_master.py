@@ -1,7 +1,8 @@
 import customtkinter as ctk
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk, Menu
-import os, threading, subprocess, zipfile, shutil, psutil, re, time, hashlib, queue
+import os, threading, subprocess, zipfile, shutil, psutil, re, time, hashlib, queue, json
+import platform, webbrowser
 import xml.etree.ElementTree as ET
 
 try:
@@ -223,11 +224,19 @@ class APKMasterV59(ctk.CTk):
         self.grid_rowconfigure(0, weight=1)
 
         # 1. Log console at bottom (must exist before any self.log() call)
+        log_frame = ctk.CTkFrame(self, fg_color="#111827", corner_radius=0)
+        log_frame.grid(row=1, column=0, columnspan=2, sticky="ew")
+        log_frame.grid_columnconfigure(0, weight=1)
         self.log_text = ctk.CTkTextbox(
-            self, height=130, font=("Consolas", 11),
+            log_frame, height=130, font=("Consolas", 11),
             fg_color="#111827", text_color="#00FF90", corner_radius=0,
         )
-        self.log_text.grid(row=1, column=0, columnspan=2, sticky="ew")
+        self.log_text.grid(row=0, column=0, sticky="nsew")
+        ctk.CTkButton(
+            log_frame, text="Log speichern", width=110, height=28,
+            font=("Segoe UI", 11), fg_color="#374151", hover_color="#4B5563",
+            corner_radius=6, command=self._export_log,
+        ).grid(row=0, column=1, padx=6, pady=4, sticky="ne")
 
         # 2. Left sidebar
         self._build_sidebar()
@@ -703,6 +712,31 @@ class APKMasterV59(ctk.CTk):
             pass
         return "Unidentifiziert", "err.apk", "ERR", "0"
 
+    def get_apk_extended_metadata(self, apk_path):
+        """Extract certificate signer and SDK versions (Androguard only).
+
+        Returns a dict with 'signer', 'min_sdk', 'target_sdk' keys.
+        Values are ``None`` when the information cannot be extracted.
+        """
+        info = {"signer": None, "min_sdk": None, "target_sdk": None}
+        if not ANDROGUARD_AVAILABLE:
+            return info
+        try:
+            a = APK(apk_path)
+            info["min_sdk"] = a.get_min_sdk_version()
+            info["target_sdk"] = a.get_target_sdk_version()
+            certs = a.get_certificates()
+            if certs:
+                cert = certs[0]
+                subject = cert.subject
+                parts = []
+                for attr in subject:
+                    parts.append(f"{attr.oid._name}={attr.value}")
+                info["signer"] = ", ".join(parts) if parts else str(subject)
+        except Exception:
+            pass
+        return info
+
     # =========================================================================
     # SCAN
     # =========================================================================
@@ -773,12 +807,20 @@ class APKMasterV59(ctk.CTk):
 
     def pipeline_thread_monolith(self):
         strat = self.mode_var.get()
+        total = len(self.pipeline_queue)
+        processed = 0
         while self.pipeline_queue:
             if not self.is_running:
                 break
             apk_p = self.pipeline_queue.pop(0)
+            processed += 1
             app_n, pkg, ver, code = self.get_apk_metadata(apk_p)
-            self.log(f"\n--- HARVESTING: {app_n} ---")
+            pct = int(processed / total * 100) if total else 0
+            self.log(f"\n--- [{processed}/{total} · {pct}%] HARVESTING: {app_n} ---")
+            self.after(0, lambda p=pct, n=app_n:
+                       self.status_var.set(f"Pipeline {p}% – {n}"))
+
+            ext_meta = self.get_apk_extended_metadata(apk_p)
 
             target_dir = os.path.join(self.library_dir,
                                       f"{pkg.replace('.', '_')}_v{ver}")
@@ -790,12 +832,13 @@ class APKMasterV59(ctk.CTk):
                 ["java", "-Xmx4G", "-jar", apktool_jar, "d", apk_p,
                  "-o", workspace, "-f"]) == 0:
                 relevant_classes = []
+                threat_details = {}
                 if strat == "RAW":
                     self.security_only_scan_monolith(workspace, target_dir)
                 else:
                     if strat in ("FULL", "CODE"):
-                        relevant_classes = self.harvest_code_monolith(
-                            workspace, target_dir, pkg)
+                        relevant_classes, threat_details = (
+                            self.harvest_code_monolith(workspace, target_dir, pkg))
                     if strat in ("FULL", "UI"):
                         self.harvest_ux_monolith(workspace, target_dir)
                     if strat == "FULL":
@@ -809,6 +852,8 @@ class APKMasterV59(ctk.CTk):
                 self.generate_monolithic_report(
                     target_dir, app_n, pkg, ver, code, apk_p,
                     relevant_classes, permissions, domains,
+                    threat_details=threat_details,
+                    ext_meta=ext_meta,
                 )
                 if strat != "RAW":
                     shutil.rmtree(workspace, ignore_errors=True)
@@ -893,7 +938,11 @@ class APKMasterV59(ctk.CTk):
     # =========================================================================
 
     def harvest_code_monolith(self, ws, target, pkg_id):
-        """Harvest smali; return list of relevant class names for Overview.md."""
+        """Harvest smali; return (relevant_classes, threat_details) for Overview.md.
+
+        *threat_details* maps category → list of flagged filenames so the report
+        can show exactly which threat categories were triggered.
+        """
         p_core = os.path.join(target, "_CODE")
         p_sdk  = os.path.join(target, "_SDK")
         p_sec  = os.path.join(target, "_THREATS")
@@ -902,6 +951,7 @@ class APKMasterV59(ctk.CTk):
 
         pkg_sl = pkg_id.replace(".", "/")
         relevant_classes = []
+        threat_details: dict[str, list[str]] = {}
         ENTRY_KEYWORDS = (
             "mainactivity", "service", "manager", "handler",
             "receiver", "provider", "worker",
@@ -928,9 +978,13 @@ class APKMasterV59(ctk.CTk):
                     except Exception:
                         continue
 
-                    # Threat scan
-                    if any(sig in content
-                           for sub in self.THREATS.values() for sig in sub):
+                    # Categorised threat scan
+                    flagged = False
+                    for cat, sigs in self.THREATS.items():
+                        if any(sig in content for sig in sigs):
+                            flagged = True
+                            threat_details.setdefault(cat, []).append(f)
+                    if flagged:
                         shutil.copy2(src, os.path.join(
                             p_sec, f"{rel.replace(os.sep, '_')}_{f}"))
 
@@ -950,7 +1004,7 @@ class APKMasterV59(ctk.CTk):
                     os.makedirs(df, exist_ok=True)
                     shutil.copy2(src, os.path.join(df, f))
 
-        return relevant_classes
+        return relevant_classes, threat_details
 
     def security_only_scan_monolith(self, ws, target):
         sec_p = os.path.join(target, "_SECURITY_RAW")
@@ -1021,14 +1075,19 @@ class APKMasterV59(ctk.CTk):
 
     def generate_monolithic_report(self, target, name, pkg, ver, code, origin,
                                    relevant_classes=None, permissions=None,
-                                   domains=None):
-        """Write Overview.md with permission classification and domain deduplication."""
+                                   domains=None, *, threat_details=None,
+                                   ext_meta=None):
+        """Write Overview.md + Overview.json with categorised threat details."""
         if relevant_classes is None:
             relevant_classes = []
         if permissions is None:
             permissions = []
         if domains is None:
             domains = []
+        if threat_details is None:
+            threat_details = {}
+        if ext_meta is None:
+            ext_meta = {}
 
         # Classify permissions
         critical = sorted(p for p in permissions if p in self.PERMISSIONS_CRITICAL)
@@ -1042,15 +1101,27 @@ class APKMasterV59(ctk.CTk):
                          if any(ad in d for ad in self.AD_DOMAINS)]
         clean_domains = [d for d in domains if d not in ad_domains]
 
+        timestamp = time.ctime()
+
         lines = [
             f"# Overview: {name}",
             "",
             f"* **Package:** `{pkg}`",
             f"* **Version:** `{ver}` (Code: {code})",
             f"* **Source:** `{origin}`",
-            f"* **Date:** {time.ctime()}",
-            "",
+            f"* **Date:** {timestamp}",
         ]
+
+        # Extended metadata (signer, SDK versions)
+        signer = ext_meta.get("signer")
+        min_sdk = ext_meta.get("min_sdk")
+        target_sdk = ext_meta.get("target_sdk")
+        if min_sdk or target_sdk:
+            lines.append(
+                f"* **SDK:** min {min_sdk or '?'} / target {target_sdk or '?'}")
+        if signer:
+            lines.append(f"* **Signiert von:** `{signer}`")
+        lines.append("")
 
         # --- Entry points ---
         lines += ["## Einstieg (vermutlich relevant)", ""]
@@ -1095,10 +1166,19 @@ class APKMasterV59(ctk.CTk):
         if not domains:
             lines += ["*(keine URLs gefunden)*", ""]
 
-        # --- Threat summary ---
+        # --- Categorised threat summary ---
         lines += ["## Threat-Hinweise", ""]
         threat_dir = os.path.join(target, "_THREATS")
-        if os.path.exists(threat_dir):
+        if threat_details:
+            total_threat_files = sum(len(v) for v in threat_details.values())
+            lines.append(
+                f"* **{total_threat_files}** verdächtige Datei(en) in "
+                f"**{len(threat_details)}** Kategorie(n):")
+            lines.append("")
+            for cat in sorted(threat_details):
+                lines.append(f"  * **{cat}**: {len(threat_details[cat])} Treffer")
+            lines.append("")
+        elif os.path.exists(threat_dir):
             threat_files = os.listdir(threat_dir)
             if threat_files:
                 lines.append(
@@ -1109,10 +1189,39 @@ class APKMasterV59(ctk.CTk):
             lines.append("* *(Threat-Scan nicht ausgeführt)*")
         lines.append("")
 
-        out_path = os.path.join(target, "Overview.md")
-        with open(out_path, "w", encoding="utf-8") as fh:
+        # --- Write Markdown report ---
+        out_md = os.path.join(target, "Overview.md")
+        with open(out_md, "w", encoding="utf-8") as fh:
             fh.write("\n".join(lines))
-        self.log(f"Overview.md erstellt: {out_path}")
+        self.log(f"Overview.md erstellt: {out_md}")
+
+        # --- Write JSON report (machine-readable, enables CI/automation) ---
+        report_data = {
+            "package": pkg,
+            "app_name": name,
+            "version": ver,
+            "version_code": code,
+            "source": origin,
+            "date": timestamp,
+            "min_sdk": min_sdk,
+            "target_sdk": target_sdk,
+            "signer": signer,
+            "entry_points": relevant_classes[:20],
+            "permissions": {
+                "critical": critical,
+                "notable": notable,
+                "normal": normal,
+            },
+            "network": {
+                "domains": clean_domains,
+                "ad_tracking": ad_domains,
+            },
+            "threats": {cat: len(files) for cat, files in threat_details.items()},
+        }
+        out_json = os.path.join(target, "Overview.json")
+        with open(out_json, "w", encoding="utf-8") as fh:
+            json.dump(report_data, fh, indent=2, ensure_ascii=False)
+        self.log(f"Overview.json erstellt: {out_json}")
 
     # =========================================================================
     # TABLE / GRID
@@ -1189,6 +1298,18 @@ class APKMasterV59(ctk.CTk):
             self.sel_tree.move(k, "", i)
         self.sort_states[col] = rev
 
+    @staticmethod
+    def _open_folder(path):
+        """Open *path* in the platform's file manager (cross-platform)."""
+        folder = os.path.dirname(str(path))
+        system = platform.system()
+        if system == "Windows":
+            os.startfile(folder)
+        elif system == "Darwin":
+            subprocess.Popen(["open", folder])
+        else:
+            subprocess.Popen(["xdg-open", folder])
+
     def show_context_menu_monolith(self, event):
         item = self.sel_tree.identify_row(event.y)
         if item:
@@ -1196,7 +1317,7 @@ class APKMasterV59(ctk.CTk):
             m = Menu(self, tearoff=0)
             p = self.sel_tree.item(item)["values"][6]
             m.add_command(label="Im Explorer öffnen",
-                          command=lambda: os.startfile(os.path.dirname(p)))
+                          command=lambda: self._open_folder(p))
             m.post(event.x_root, event.y_root)
 
     def filter_table(self):
@@ -1326,6 +1447,21 @@ class APKMasterV59(ctk.CTk):
             except queue.Empty:
                 break
         self.after(100, self._drain_log)
+
+    def _export_log(self):
+        """Save the current log console content to a text file."""
+        path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            filetypes=[("Text", "*.txt"), ("Log", "*.log")],
+            initialfile=f"apk_master_log_{time.strftime('%Y%m%d_%H%M%S')}.txt",
+        )
+        if path:
+            try:
+                with open(path, "w", encoding="utf-8") as fh:
+                    fh.write(self.log_text.get("1.0", "end"))
+                self.log(f"Log exportiert: {path}")
+            except Exception as e:
+                self.log(f"Fehler beim Log-Export: {e}")
 
     # =========================================================================
     # PATH MANAGEMENT
