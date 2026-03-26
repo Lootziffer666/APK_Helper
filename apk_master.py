@@ -2,7 +2,7 @@ import customtkinter as ctk
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk, Menu
 import os, threading, subprocess, zipfile, shutil, psutil, re, time, hashlib, queue, json
-import platform, webbrowser
+import platform
 import xml.etree.ElementTree as ET
 
 try:
@@ -817,7 +817,7 @@ class APKMasterV59(ctk.CTk):
             app_n, pkg, ver, code = self.get_apk_metadata(apk_p)
             pct = int(processed / total * 100) if total else 0
             self.log(f"\n--- [{processed}/{total} · {pct}%] HARVESTING: {app_n} ---")
-            self.after(0, lambda p=pct, n=app_n:
+            self.after(0, lambda p=pct, n=app_n[:50]:
                        self.status_var.set(f"Pipeline {p}% – {n}"))
 
             ext_meta = self.get_apk_extended_metadata(apk_p)
@@ -951,7 +951,7 @@ class APKMasterV59(ctk.CTk):
 
         pkg_sl = pkg_id.replace(".", "/")
         relevant_classes = []
-        threat_details: dict[str, list[str]] = {}
+        threat_details = {}
         ENTRY_KEYWORDS = (
             "mainactivity", "service", "manager", "handler",
             "receiver", "provider", "worker",
@@ -1302,13 +1302,16 @@ class APKMasterV59(ctk.CTk):
     def _open_folder(path):
         """Open *path* in the platform's file manager (cross-platform)."""
         folder = os.path.dirname(str(path))
-        system = platform.system()
-        if system == "Windows":
-            os.startfile(folder)
-        elif system == "Darwin":
-            subprocess.Popen(["open", folder])
-        else:
-            subprocess.Popen(["xdg-open", folder])
+        try:
+            system = platform.system()
+            if system == "Windows":
+                os.startfile(folder)
+            elif system == "Darwin":
+                subprocess.Popen(["open", folder])
+            else:
+                subprocess.Popen(["xdg-open", folder])
+        except Exception:
+            pass
 
     def show_context_menu_monolith(self, event):
         item = self.sel_tree.identify_row(event.y)
