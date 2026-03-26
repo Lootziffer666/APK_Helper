@@ -1532,14 +1532,9 @@ class APKMasterV59(ctk.CTk):
             reverse=True,
         )
         total_hits = sum(
-            len(v) for v in threat_details.items() if isinstance(v, list)
+            len(v) if isinstance(v, list) else int(v)
+            for v in threat_details.values()
         ) if threat_details else 0
-        # Fallback: count from threats dict values
-        if not total_hits and threat_details:
-            total_hits = sum(
-                len(v) if isinstance(v, list) else int(v)
-                for v in threat_details.values()
-            )
         threat_score = min(10.0, round(total_hits / 5 + len(critical) * 0.5, 1))
 
         metadata = {
